@@ -1,66 +1,115 @@
-# Chapter 4 — System architecture (section text)
+# Programming effort — client, middle-tier, and data-tier implementation
 
-Use the headings below as **4.1**, **4.2**, etc., in your report. Wording distinguishes **implemented** behavior from **planned / extension** items where the repository has hooks but no live integration.
-
----
-
-## 4.1 Overall Architecture Overview
-
-Meeting Intelligence is a distributed system whose responsibilities are split across a browser-hosted UI, a primary HTTP API, an asynchronous ingest worker, a document database, and third-party meeting and AI services. End users manage meetings, transcripts, and action-item review through the web application; automated capture and enrichment are triggered by external events rather than by user clicks alone.
-
-### 4.1.1 Layered Service-Oriented Architecture
-
-The system follows a **layered, service-oriented** layout:
-
-1. **Presentation layer** — A React single-page application (TypeScript, Vite) implements the dashboard, meeting browser, per-meeting detail, human-in-the-loop action-item review, and processing-log views. It depends only on REST JSON over HTTP to the application layer.
-
-2. **Application / API layer** — A FastAPI service exposes versioned resources under `/api` (dashboard aggregates, projects and rosters, meeting metadata and detail, action-item review operations, paginated processing logs). It enforces request/response schemas, applies business rules for review workflows, and ensures database indexes at startup. This layer is the **single integration point** for the UI.
-
-3. **Ingest / integration service** — Station Alpha, a Node.js Express application, receives Zoom account webhooks, drives Recall.ai meeting bots, retrieves transcripts, and invokes an LLM for structured action-item extraction. It persists results by writing to the same MongoDB database the API uses, using compatible collection and field names.
-
-4. **Data layer** — MongoDB stores meetings, transcripts, action items, processing logs, projects, participants, and join tables. Both FastAPI (Motor) and Station Alpha (native driver via Mongoose connection) are **consumers and producers** of this store.
-
-5. **External service layer** — Zoom (events and optional OAuth-backed REST), Recall.ai (bot and transcript API), and OpenAI (extraction) sit outside the deployment boundary and are invoked only from Station Alpha or via configured credentials.
-
-This decomposition keeps concerns separable: the UI team can evolve against a stable OpenAPI surface; ingest can scale or fail independently while leaving the API and data model as the contract; and the database remains the shared source of truth.
-
-### 4.1.2 Event-Driven Processing Model
-
-Downstream processing is **event-driven** at the boundary with Zoom. When Zoom emits lifecycle events (notably `meeting.started` and `meeting.ended`), Station Alpha handles them asynchronously relative to the user’s session: it may create or update a meeting document, dispatch a bot, wait for transcript completion after the meeting ends, run extraction, and then update meeting `processing_status`, transcript and action-item documents, and append **processing log** rows.
-
-The model is **durable and observable**: each significant step can emit a `processing_logs` entry with a `stage` (e.g. ingestion, transcript processing, extraction) and `status` (success, failure, pending, skipped). The web application’s Logs view reads these records through the API, giving operators a timeline aligned with the pipeline rather than with individual HTTP requests from the browser.
-
-Human review (approve / reject / bulk operations) remains **request-driven** over REST; it complements the event-driven ingest path by updating action-item state after automation has produced `pending_review` items.
+This chapter describes the programming work sufficient for a reader to understand what was built, with emphasis on the **innovative or non-obvious** parts of Meeting Intelligence: automated meeting ingest, transcript normalization, LLM-based extraction with **human-in-the-loop review**, and a **shared-database** pattern between two server runtimes. It does not list every file; see the repository tree for completeness.
 
 ---
 
-## 4.2 Core System Layers
+## Client implementation
 
-### 4.2.1 Input Layer (Transcript Ingestion)
+The **client** is a single-page application (SPA) under `frontend/`, implemented with **React** and **TypeScript**, bundled by **Vite**. The entry point wires **React Router** for client-side navigation and a top-level **error boundary** so rendering failures do not blank the entire shell (`main.tsx`, `App.tsx`).
 
-The **input layer** is responsible for bringing meeting content into the system without manual upload in the primary flow.
+### Scope and routes
 
-- **Zoom webhooks** — Station Alpha exposes HTTPS endpoints for Zoom’s event subscription. Webhook payloads are verified using Zoom-issued secret tokens before handling. URL validation challenges from Zoom are answered so the subscription can activate.
+The UI supports the product narrative end to end:
 
-- **Meeting metadata** — On `meeting.started`, the service upserts a `meetings` document keyed by Zoom’s meeting identifier, sets lifecycle fields appropriate to an in-flight capture, and records an ingestion-stage processing log.
+- **Dashboard** (`/`) — Rolling metrics, initiative filters, and a paginated, sortable meeting table aligned with backend query parameters (`DashboardHome.tsx`).
+- **Meetings** (`/meetings`, `/meetings/:id`) — List and rich **meeting detail**: metadata, transcript segments, participants, action items, related links, and inline editing of initiative context where the API allows (`MeetingsList.tsx`, `MeetingDetailPage.tsx`).
+- **Review queue** (`/review`, `/review/item/:itemId`) — **Human-in-the-loop** workflow: operators inspect LLM-proposed action items, edit fields, approve or reject, including bulk actions per meeting (`ReviewQueuePage.tsx`, `ReviewItemPage.tsx`). This is a central “innovation” in the sense that raw model output is not treated as ground truth.
+- **Observability** (`/logs`) — Paginated **processing logs** with optional filters, so users can correlate UI state with ingest and extraction stages (`LogsPage.tsx`).
 
-- **Recall.ai bot** — The service constructs a join URL (including passcode when available, optionally from Zoom’s REST API) and instructs Recall to send a bot into the live meeting. The Recall bot identifier is stored on the meeting document for correlation when the meeting ends.
+Navigation and layout use a persistent sidebar (`NavSidebar.tsx`) and shared dashboard styling (`styles/dashboard.css`, `App.css`).
 
-- **Transcript retrieval** — On `meeting.ended`, the service waits for Recall to finish, fetches the transcript artifact, normalizes it into plain text and speaker segments, and prepares it for persistence and downstream NLP.
+### API integration pattern
 
-Together, these components form the **ingress path** from live collaboration software into the application’s data model.
+All server communication is centralized in **`src/api.ts`**: typed `fetch` wrappers, query-string construction for pagination and filters, and **normalization** of JSON into stable TypeScript shapes (`normalizeDashboardSummary`, `normalizeMeetingListItem`, `normalizePages`, etc.). That pattern defends the UI against minor API evolution and keeps pages readable.
 
-### 4.2.2 Processing Layer (AI / NLP Engine)
+In development, **`vite.config.ts`** proxies `/api` to the FastAPI process so the browser can use relative URLs without configuring CORS for every experiment. For production builds, **`VITE_API_BASE_URL`** targets the deployed API host.
 
-The **processing layer** turns raw transcript text into reviewable work items.
+### Why this matters for the reader
 
-- **Structural transcript handling** — Recall output is mapped to a consistent segment structure (speaker labels where available, contiguous text) and stored as `raw_text` plus `segments` in the `transcripts` collection, with one transcript document per meeting.
+The client deliberately **does not** talk to the Zoom ingest service (Station Alpha). Every feature the user sees is backed by one contract: the **FastAPI** `/api` surface. That separation simplifies deployment and security (the ingest URL stays server-to-server with Zoom).
 
-- **Action-item extraction** — An LLM (OpenAI API) consumes the transcript and returns candidate action items (description, assignee, due date hints). The ingest service writes each candidate as an `action_items` document with metadata such as confidence and `pending_review` status so humans can correct or reject before any downstream ticketing.
+---
 
-- **Server-side business logic (API)** — FastAPI services compute dashboard metrics, enforce valid state transitions on action items (including statuses used for reporting, such as approved, rejected, and ticket-created), and merge initiative and meeting context for display. This layer does not replace the LLM for initial extraction; it governs **post-extraction** workflow and aggregation.
+## Middle-tier implementation
 
-Pipeline stages beyond extraction—such as automated assignment or outbound notifications—are represented in the domain model as **future stages**; the extraction and review path is fully exercised in the current codebase.
+The “middle tier” in this project is **split across two services**, which is intentional: one serves the browser; the other reacts to external events and third-party APIs.
+
+### 1. Application API (FastAPI)
+
+Location: `backend/app/`.
+
+**Role:** Authoritative HTTP API for the SPA—validation, orchestration of reads/writes to MongoDB, and business rules for **action-item review** (state transitions, bulk operations, editable fields).
+
+**Structure:**
+
+- **`main.py`** — FastAPI app, CORS, lifespan hook that runs **`ensure_indexes()`** on startup.
+- **`routers/`** — Route modules grouped by domain: `dashboard`, `projects`, `meetings`, `action_items`, `logs`, mounted under `settings.api_prefix` (default `/api`).
+- **`schemas/`** — Pydantic models for request bodies and responses (strong typing and OpenAPI generation).
+- **`services/`** — Domain logic (e.g. dashboard aggregation, meeting detail assembly, team roster updates, related-link resolution, observability-oriented queries).
+
+**Innovation-relevant behavior:** The API implements the **review queue** and **approval/rejection** semantics that turn “model suggestions” into governed records. It also exposes **processing logs** so operators can debug ingest without SSH or raw database access.
+
+OpenAPI documentation is available at `/docs` when the server runs, which documents the contract the client relies on.
+
+### 2. Ingest and integration service (Station Alpha)
+
+Location: `station-alpha/src/`.
+
+**Role:** **Event-driven** pipeline: Zoom webhooks → Recall.ai bot → transcript download → OpenAI extraction → **direct writes** to the same MongoDB collections the API reads.
+
+**Key modules:**
+
+- **`index.js`** — Express app, Mongo connection, mounts webhook and OAuth callback routes.
+- **`routes/zoomWebhooks.js`** — Validates Zoom requests, handles `meeting.started` / `meeting.ended`, orchestrates Recall polling and OpenAI calls, and calls into persistence helpers with **salvage paths** (save transcript even if extraction fails).
+- **`services/recallService.js`** — Recall REST calls (create bot, poll status, fetch transcript via download URL).
+- **`services/openaiService.js`** — Chat completion with **JSON output** for structured action items.
+- **`services/meetingIntelligenceSync.js`** — Idempotent-style writes: replace transcript for a meeting, replace extracted items, append `processing_logs`, update meeting lifecycle fields.
+
+**Innovation-relevant behavior:** The middle tier here is not a classic “CRUD only” layer—it is an **integration orchestrator** with **defensive persistence** (logging failures, optional warnings when the LLM is unavailable) so operational data is still captured.
+
+Zoom OAuth-related code (`oauthCallback.js`, `zoomAuth.js`, `zoomApi.js`) supports optional REST usage (e.g. meeting passcode) alongside webhooks.
+
+---
+
+## Data-tier implementation
+
+The **data tier** is **MongoDB**, database name configurable (default `meeting_intelligence`). The schema is **document-oriented**: references by ObjectId, some denormalized fields for display (e.g. initiative labels on meetings), and embedded arrays where appropriate (transcript segments, related links).
+
+### Collections and relationships
+
+The logical model is documented in **`docs/database-schema.md`** (Mermaid ER diagram). Core entities include:
+
+- **`meetings`** — Lifecycle and processing state, Zoom correlation fields (`zoom_meeting_id`, `recall_bot_id`), optional `project_id`, context overrides.
+- **`transcripts`** — One document per meeting (unique index on `meeting_id`).
+- **`action_items`** — Extracted tasks with `pending_review` → approved/rejected (and `ticket_created` for reporting scenarios).
+- **`processing_logs`** — Append-only style operational history per meeting.
+- **`projects`**, **`participants`**, **`meeting_participants`** — Initiatives and attendance modeling.
+
+### Indexing and consistency
+
+**`backend/app/db.py`** defines **`ensure_indexes()`** invoked at API startup: time-based and filter columns for the dashboard, uniqueness for one transcript per meeting, sparse unique `zoom_meeting_id` for ingest idempotency, compound uniqueness on meeting–participant pairs, and sparse unique email on participants.
+
+### Dual-writer pattern
+
+Two runtimes write the same database:
+
+1. **FastAPI + Motor** — Async reads/writes for user-driven updates and queries.
+2. **Station Alpha** — Uses Mongoose’s connection to obtain the native driver and write **compatible documents** expected by the API serializers.
+
+The programming effort on the data tier therefore includes **cross-service schema discipline**: field names and types must stay aligned so the UI and API do not break when ingest runs.
+
+---
+
+## Summary
+
+| Tier | Primary implementation | Main responsibility |
+|------|------------------------|---------------------|
+| **Client** | React + TypeScript (`frontend/`) | Operator UX: dashboard, meetings, **human review**, logs; calls FastAPI only. |
+| **Middle-tier** | FastAPI (`backend/`) + Express ingest (`station-alpha/`) | REST API + webhook-driven **AI pipeline** and external integrations (Zoom, Recall, OpenAI). |
+| **Data-tier** | MongoDB + indexes (`db.py`, shared writes) | Durable transcripts, action items, logs, projects/participants. |
+
+For deeper file-level detail, see **`docs/architecture-chapter-6-sections.md`**. For citations to external products and standards, see **`docs/references.md`**.
 
 ### 4.2.3 Data Layer (Persistence and Storage)
 
