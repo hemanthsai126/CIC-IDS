@@ -1,7 +1,7 @@
 # Plan: Arrakis As The Brain For Ben Voice Calls
 
 Date: 2026-06-02
-Status: Waiting for PR #991 to merge, then reapply on latest main
+Status: Ready to reapply on latest main after PR #991 merge
 
 ## Objective
 
@@ -37,15 +37,16 @@ The expected customer experience is simple:
 - Do not deploy production changes until preview is validated.
 - Do not change the database schema for the first version unless a real runtime
   need appears.
-- Do not overwrite Parth's PR #991 changes. Reapply this work after that PR
-  lands on `main`.
+- Build on top of the merged PR #991 changes instead of reviving the temporary
+  preview-only branch.
 - Keep preview Vapi assistant IDs separate from production assistant IDs.
 - Keep the existing Arrakis dashboard workflow intact.
 
-## Current Dependency
+## Current Base
 
-PR #991, `Refine Arrakis Oracle Ben engagement flow`, updates the Oracle and Ben
-engagement flow. It touches the same area this voice work needs:
+PR #991, `Refine Arrakis Oracle Ben engagement flow`, has merged and is now part
+of the base this work should build on. It updated the Oracle and Ben engagement
+flow in areas this voice work also needs:
 
 - Ben text/backoffice prompting
 - Ben runtime payloads
@@ -54,9 +55,9 @@ engagement flow. It touches the same area this voice work needs:
 - Data API operation logic
 - research completion handoff triggers
 
-Because of that overlap, the voice brain work should be reapplied only after
-PR #991 is merged. The next implementation should start from latest `main`, not
-from the temporary preview revision used for the first Vapi smoke test.
+Because of that overlap, the voice brain work should be reapplied from latest
+`main`, preserving PR #991 behavior and avoiding the temporary preview revision
+used for the first Vapi smoke test.
 
 ## Ownership Model
 
@@ -403,20 +404,19 @@ For preview V0, keep this runtime-computed unless testing proves it is unstable.
 
 ## Implementation Sequence After PR #991
 
-1. Wait for PR #991 to merge.
-2. Update local `main`.
-3. Create a new branch for the voice brain reapply.
-4. Reapply the Arrakis voice oracle changes on top of latest `main`.
-5. Resolve conflicts carefully in Ben, Oracle, and Data API operation files.
-6. Make Vapi prompt/tool config thin and assistant-level where possible.
-7. Build and test Data API and backoffice locally.
-8. Deploy backoffice preview.
-9. Deploy Data API preview.
-10. Verify preview Cloud Run revisions.
-11. Run inbound preview call smoke test.
-12. Run outbound preview call smoke test.
-13. Validate field persistence and mission completion/hold behavior.
-14. Only then consider production rollout planning.
+1. Update local `main`.
+2. Create a new branch for the voice brain reapply.
+3. Reapply the Arrakis voice oracle changes on top of latest `main`.
+4. Resolve conflicts carefully in Ben, Oracle, and Data API operation files.
+5. Make Vapi prompt/tool config thin and assistant-level where possible.
+6. Build and test Data API and backoffice locally.
+7. Deploy backoffice preview.
+8. Deploy Data API preview.
+9. Verify preview Cloud Run revisions.
+10. Run inbound preview call smoke test.
+11. Run outbound preview call smoke test.
+12. Validate field persistence and mission completion/hold behavior.
+13. Only then consider production rollout planning.
 
 ## Preview Validation Checklist
 
@@ -495,4 +495,3 @@ This work is successful when:
 - The existing Arrakis SMS, WhatsApp, email, dashboard, and mission workflows
   continue to work.
 - Preview smoke tests pass before production planning starts.
-
