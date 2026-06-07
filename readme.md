@@ -1,497 +1,166 @@
-# Plan: Arrakis As The Brain For Ben Voice Calls
+# Arrakis Ben Voice Humanization Plan
 
-Date: 2026-06-02
-Status: Ready to reapply on latest main after PR #991 merge
+## Goal
 
-## Objective
+Make Ben sound like a fast, simple human intake caller, not a generic voice bot.
 
-Make Vapi voice calls behave like the existing Arrakis-controlled Ben flows for
-SMS, WhatsApp, and email.
+Ben should not independently reason through the whole sales workflow. The mission/oracle decides the objective and the next missing detail. Ben executes that instruction, confirms what matters, records the answer, and stops.
 
-Vapi should not be the source of truth for Ben's reasoning. Vapi should be the
-phone interface: it listens, speaks, and calls silent tools. Arrakis should be
-the brain: it decides whether the call is inbound or outbound, looks at lead and
-mission data, decides what Ben already knows, decides what is still missing or
-unclear, and returns the next thing Ben should say or do.
+## Evidence From Current Behavior
 
-The expected customer experience is simple:
+Recent call/timeline review and prompt inspection show a few recurring problems:
 
-- For inbound calls, Ben answers as Kinro and starts from the current lead or
-  intake context.
-- For outbound calls, Ben says he is calling about the customer's insurance
-  quote request.
-- Ben confirms existing details once, naturally.
-- Ben asks only for missing or unclear details after that.
-- Ben does not ask for details Arrakis already knows unless the customer says
-  they are wrong.
-- If Arrakis has no useful details for the caller, Ben runs the full intake.
-- If autopilot is enabled and details are missing, Ben can initiate an outbound
-  call to collect those details.
+- Ben repeats his identity. The current Vapi first message says `Hello, this is Ben calling from Kinro`, and the runtime prompt also says the opening should identify Ben from Kinro. This can produce repeated "Hi, Ben from Kinro" turns.
+- Ben uses call-center filler like "just a sec" instead of acknowledging the customer's answer and moving on.
+- Ben sometimes treats operator-originated call paths as if the customer called Kinro, leading to phrases like "thanks for calling Kinro" on outbound/follow-up calls.
+- Ben does not consistently confirm details back in a human way. He may collect facts without saying "got it" or "I have X, just need Y."
+- Ben can keep asking after the useful objective is already done because the prompt says to collect missing and unclear details, but does not make "stop early" concrete enough.
+- Tool calls are intentionally minimal, which is good, but Ben needs clearer rules for when to call tools and when to simply speak.
 
-## Guardrails
+## Behavioral Contract
 
-- Do not let this change break SMS, WhatsApp, or email Ben flows.
-- Do not let Vapi become an independent Ben brain with duplicated business
-  logic.
-- Do not put all intelligence into a long static Vapi assistant prompt.
-- Do not deploy production changes until preview is validated.
-- Do not change the database schema for the first version unless a real runtime
-  need appears.
-- Build on top of the merged PR #991 changes instead of reviving the temporary
-  preview-only branch.
-- Keep preview Vapi assistant IDs separate from production assistant IDs.
-- Keep the existing Arrakis dashboard workflow intact.
+Ben has one job per turn:
 
-## Current Base
+1. Say one short, natural sentence.
+2. Ask one clear question, only if the oracle/mission says something is still needed.
+3. If the customer answers a detail, record only that detail.
+4. If enough is collected, close and stop.
 
-PR #991, `Refine Arrakis Oracle Ben engagement flow`, has merged and is now part
-of the base this work should build on. It updated the Oracle and Ben engagement
-flow in areas this voice work also needs:
+Ben should never broaden the workflow. He should not discover new tasks, pitch Kinro, explain the whole process, or ask a full intake script unless the mission explicitly says to.
 
-- Ben text/backoffice prompting
-- Ben runtime payloads
-- Oracle handoff behavior
-- default missions and SMS sequences
-- Data API operation logic
-- research completion handoff triggers
+## Prompt Changes
 
-Because of that overlap, the voice brain work should be reapplied from latest
-`main`, preserving PR #991 behavior and avoiding the temporary preview revision
-used for the first Vapi smoke test.
+### Identity And Opening
 
-## Ownership Model
+Replace the double-intro pattern with a single source of truth.
 
-### Arrakis Owns
+Current issue:
 
-Arrakis decides:
+- `firstMessage`: "Hello, this is Ben calling from Kinro."
+- runtime prompt: "Opening: identify yourself as Ben from Kinro..."
 
-- whether the call is `inbound` or `outbound`;
-- which lead, customer, call, and active mission the call belongs to;
-- which facts are already known;
-- which required details are missing;
-- which optional or collected details are unclear;
-- which fields Ben should not ask again;
-- the call agenda for this turn;
-- whether Ben should ask a question, confirm a detail, complete intake, hold the
-  mission, or end the call;
-- whether a research/oracle agent should be consulted before answering.
+Change to:
 
-### Vapi Owns
+- `firstMessage`: "Hi, this is Ben from Kinro. Is now still an okay time?"
+- runtime prompt: "Do not introduce yourself again after the first message. If the customer asks who you are, answer once: 'I'm Ben with Kinro, following up on your business insurance request.'"
 
-Vapi should only handle:
+Channel-specific rule:
 
-- telephony;
-- speech-to-text;
-- text-to-speech;
-- turn-level tool calls;
-- voicemail detection;
-- call ending.
+- Outbound: "I am following up on your business insurance request."
+- Inbound: "How can I help with your business insurance?"
+- Never say "thanks for calling Kinro" unless the call is truly an inbound customer call to a Kinro number.
 
-Vapi should receive a thin assistant prompt that says, in effect:
+### Confirmation Style
 
-- use Arrakis as the source of truth;
-- call the Arrakis voice oracle after meaningful caller turns;
-- say only what Arrakis tells you to say;
-- call tools silently;
-- never mention JSON, function names, tool names, or internal commands.
+Add a required confirmation pattern:
 
-## Voice Context Contract
-
-Arrakis should build a voice context for every meaningful call turn.
-
-Required context:
-
-```ts
-type BenVoiceContext = {
-  callId: string | null;
-  vapiCallId: string | null;
-  leadId: string | null;
-  phoneE164: string | null;
-  direction: "inbound" | "outbound";
-  latestCustomerText: string;
-  transcriptSoFar: Array<{
-    role: "assistant" | "customer" | "tool";
-    text: string;
-    at?: string | null;
-  }>;
-  knownDetails: Record<string, unknown>;
-  missingDetails: Record<string, unknown>;
-  unclearDetails: Record<string, unknown>;
-  doNotAskFields: string[];
-  callAgenda: string[];
-  priorContextSummary: string | null;
-  activeMission: Record<string, unknown> | null;
-  assistantState: Record<string, unknown> | null;
-};
-```
-
-This does not require a new table for V0. Most of this can be computed from
-existing lead data, active mission data, call metadata, and the current
-transcript.
-
-## Detail Classification
-
-Arrakis should classify details before Ben speaks.
-
-### Known Details
-
-Fields Arrakis already trusts enough to use conversationally.
+- Acknowledge each useful answer in 3-6 words.
+- Confirm known details once, not every turn.
+- Before asking for a new detail, name what Ben already has when it reduces confusion.
 
 Examples:
 
-- first name;
-- last name;
-- phone number;
-- email;
-- company name;
-- business type;
-- state;
-- zip code;
-- requested coverage;
-- current policy or renewal timing if available.
+- "Got it, general liability."
+- "Okay, Desert Bloom Candles in California."
+- "I have the business and coverage. I just need the ZIP code."
+- "Perfect, that is enough for us to follow up."
 
-Ben should confirm these once in one concise sentence, not one by one.
+Do not say:
 
-Example:
+- "Just a sec."
+- "Let me process that."
+- "I am checking my system."
+- "Thanks for calling Kinro" on outbound calls.
+- "Hi, this is Ben from Kinro" more than once.
 
-> I have that you're looking for workers' comp for a restaurant in Texas. Is
-> that still right?
+### Oracle/Mission Obedience
 
-### Missing Details
+Add hard rules:
 
-Required fields Arrakis does not have yet.
+- The mission/oracle is the source of truth.
+- Ask only the current missing detail or the exact next question from the mission.
+- If the customer answers something outside the asked detail but it is useful, record it, then return to the mission.
+- If the customer asks a question outside Ben's allowed scope, say a human will follow up.
+- If the mission says no more details are needed, close immediately.
 
-For full intake, the required fields are:
+### Tool Calls
 
-- coverage type;
-- business type;
-- state;
-- email;
-- company name;
-- phone number;
-- first name;
-- last name;
-- zip code.
+Keep tools minimal:
 
-For an existing lead, Arrakis should only ask for the required fields that are
-missing for that lead or mission.
+- `record_intake_field`: only when the customer clearly gives or corrects one concrete field.
+- `complete_intake`: once the mission is done, customer refuses, asks for callback, or asks for a human.
+- `hold_mission`: when customer asks to stop, wants a human, asks about pricing/binding/claims/legal/coverage advice, or Ben is unsure.
 
-### Unclear Details
+Ben should not call a tool just because he is thinking. No "please wait" filler while tools run.
 
-Fields that exist but are ambiguous, low-confidence, contradictory, or not
-specific enough for quoting.
+### Fast Call Flow
 
-Ben should ask one short clarification question for one unclear detail at a
-time.
+Default outbound call flow:
 
-### Do-Not-Ask Fields
+1. "Hi, this is Ben from Kinro. Is now still an okay time?"
+2. If yes: "Great. I have this as [business] looking for [coverage]. Is that right?"
+3. If confirmed: ask exactly one missing field from the mission.
+4. After each answer: short acknowledgement + tool call if needed.
+5. When done: "Perfect, that is all I needed. Someone from Kinro can follow up with next steps."
 
-Fields that Arrakis already considers confirmed or not useful to ask again.
+If not a good time:
 
-Ben must not ask these again unless the customer says the detail is wrong or
-wants to correct it.
+1. "No problem. What is a better time to reach you?"
+2. Record callback time if provided.
+3. Complete intake and end.
 
-## Inbound Call Behavior
+If voicemail:
 
-Inbound opening:
+- "Hi, this is Ben with Kinro following up on your business insurance request. We will try you again, or you can reply to our text when convenient."
 
-> Thank you for calling Kinro, this is Ben.
+Do not use "we shop insurance at cheaper prices for you"; it sounds spammy and overpromises.
 
-After the opening, Arrakis decides what Ben says next.
+## Implementation Notes
 
-If the caller is matched to an existing lead:
+Update both prompt paths, because there are currently two relevant Ben voice prompt builders:
 
-- Ben should use the known lead and mission context.
-- Ben should confirm known details once if useful.
-- Ben should ask only for missing or unclear details.
+- `apps/arrakis/data_api/src/operations/repository.ts`
+  - `benFirstMessage()`
+  - `benVoicemailMessage()`
+  - `benRuntimeInstructions()`
+- `apps/arrakis/data_api/src/ben-agent/prompts.ts`
+  - `benFirstMessage()`
+  - `benVoicemailMessage()`
+  - `benExistingLeadRuntimeInstructions()`
+- `apps/arrakis/data_api/src/ben-agent/voice.ts`
+  - `benWebVoiceFirstMessage()`
+  - `benAnonymousWebVoiceInstructions()`
 
-If the caller is not matched to a lead or Arrakis has no useful details:
+Also consider putting shared voice rules in one helper so the Vapi outbound path and newer `ben-agent` path cannot drift.
 
-- Ben should run full intake one question at a time.
-- Ben should create or attach the correct lead according to existing Arrakis
-  lead rules.
+## Acceptance Criteria
 
-## Outbound Call Behavior
+A reviewed Ben call should pass these checks:
 
-Outbound opening:
-
-> Hi {firstName}, this is Ben calling from Kinro about your insurance quote
-> request.
-
-If first name is unavailable:
-
-> Hi, this is Ben calling from Kinro about your insurance quote request.
-
-After the opening:
-
-- Ben should not say "How can I help you today?"
-- Ben should not ask generic discovery questions if Arrakis already has the
-  answer.
-- Ben should explain the purpose of the call when needed: Kinro is following up
-  on the customer's insurance quote request.
-- Ben should confirm known details once.
-- Ben should ask only the next missing or unclear detail.
-- Ben should ask one question at a time.
-
-If the customer says "you called me" or asks why Ben is calling:
-
-> I'm following up on your Kinro insurance quote request and just need to confirm
-> a couple of details.
-
-Then Ben should ask the next Arrakis-approved question.
-
-## Autopilot Behavior
-
-When autopilot is enabled:
-
-- Arrakis/Oracle can decide that a lead needs an outbound call.
-- The Data API can initiate a Vapi outbound call for that existing lead.
-- The call must include lead, mission, known detail, and missing detail context.
-- Ben should call with a specific purpose, not a generic greeting.
-- Ben should collect only the details needed to advance the active mission.
-- Ben should persist captured fields silently.
-- Ben should complete or hold the mission when appropriate.
-
-Autopilot should not call customers when:
-
-- there is no usable phone number;
-- the customer is marked do-not-contact;
-- consent or eligibility rules fail;
-- there is no active mission or missing detail worth calling about.
-
-## AI Call Screening And Gatekeepers
-
-Ben must handle AI screening systems, receptionists, and phone gatekeepers.
-
-If the other side asks who is calling:
-
-> This is Ben from Kinro. I'm calling about the customer's business insurance
-> quote request.
-
-If asked why:
-
-> I'm following up to confirm a few details needed for their quote.
-
-If asked to identify the intended recipient:
-
-- use the customer's name if Arrakis has it;
-- otherwise ask to be connected to the person who requested the insurance quote.
-
-Ben should not collect quote details from a screening system unless it is
-clearly authorized to answer on behalf of the customer.
-
-If the gatekeeper refuses, cannot connect, or asks for a callback:
-
-- Ben should state the outcome briefly;
-- Arrakis should record the outcome;
-- the mission can be held, retried, or routed according to existing workflow
-  rules.
-
-## Silent Tool Expectations
-
-Tool calls are internal actions. Ben must never say tool names or JSON aloud.
-
-Required tools:
-
-- `ask_arrakis_voice_oracle`: ask Arrakis what Ben should say or do next.
-- `record_intake_field`: persist a provided, confirmed, or corrected field.
-- `complete_intake`: mark the voice intake or mission turn complete.
-- `hold_mission`: pause the mission and route to a human/operator path.
-- `endCall`: end the Vapi call after the final goodbye.
-- `leave_voicemail`: only for clear voicemail or answering-machine systems.
-
-Rules:
-
-- When the caller provides multiple details in one answer, capture all of them
-  silently.
-- When all missing and unclear details are handled, call `complete_intake`.
-- Before ending a live call, ask once: "Is there anything else you'd like to
-  add?"
-- End with: "The Kinro team will review everything and follow up with quote
-  options or any quick clarification questions. Goodbye."
-- Immediately call `endCall` after the final goodbye.
-- If the caller says bye or indicates the call is over, use one short closing
-  sentence and call `endCall`.
-- Only call `leave_voicemail` when the other side is clearly automated
-  voicemail or an answering machine.
-- Do not say the voicemail message directly if `leave_voicemail` will play it.
-
-## Arrakis Voice Oracle
-
-Add or preserve a Data API path that lets Vapi ask Arrakis for the next voice
-turn.
-
-Expected route:
-
-- `POST /v1/ben/voice/oracle`
-
-Expected responsibilities:
-
-- validate the voice oracle request;
-- resolve lead and mission context;
-- compute known, missing, unclear, and do-not-ask fields;
-- include call direction;
-- include recent transcript;
-- call the backoffice Ben execution agent with channel `voice`;
-- return the next speakable Ben reply and any assistant state.
-
-The backoffice Ben agent should support channel `voice` separately from `sms`,
-`whatsapp`, and `email` so voice can stay short, natural, and turn-based.
-
-## Vapi Assistant Prompt Shape
-
-The Vapi assistant prompt should be short. It should not duplicate all Arrakis
-business logic.
-
-It should say:
-
-- this is a Kinro voice agent;
-- Arrakis is the source of truth;
-- call `ask_arrakis_voice_oracle` after meaningful customer turns;
-- speak only the concise text Arrakis returns;
-- use tools silently;
-- never mention tools, functions, JSON, or internal state;
-- handle voicemail only through `leave_voicemail`;
-- end calls through `endCall` after the final goodbye.
-
-The long outbound behavior prompt can be used as product guidance, but the final
-implementation should move those decisions into Arrakis/backoffice prompts and
-runtime context.
-
-## Data API Outbound Call Creation
-
-When creating a Vapi outbound call, Data API should:
-
-- use the correct preview or production outbound assistant ID;
-- use the correct Vapi phone number for the environment;
-- send variable values for lead and mission context;
-- set a good outbound first message from Arrakis context;
-- avoid invalid `assistantOverrides.model` payloads unless provider/model are
-  included correctly;
-- prefer assistant-level tool configuration when possible.
-
-Important Vapi lesson from preview:
-
-- sending `assistantOverrides.model.tools` without a model `provider` caused a
-  Vapi `400` error;
-- the safer V0 is to configure tools on the Vapi assistant and avoid per-call
-  model overrides unless absolutely needed.
-
-## Database Schema Expectation
-
-No database schema change is expected for V0.
-
-The first implementation should compute voice behavior from existing data:
-
-- lead fields;
-- lead metadata;
-- active mission context;
-- operation/call metadata;
-- timeline events;
-- transcript turns;
-- assistant state returned during the call.
-
-A schema change should only be considered later if we need to persist structured
-voice-only state such as:
-
-- per-call confirmation checklist;
-- per-call already-asked field set;
-- voice mission attempt state;
-- callback scheduling state;
-- durable call-screening outcomes separate from existing timeline/call metadata.
-
-For preview V0, keep this runtime-computed unless testing proves it is unstable.
-
-## Implementation Sequence After PR #991
-
-1. Update local `main`.
-2. Create a new branch for the voice brain reapply.
-3. Reapply the Arrakis voice oracle changes on top of latest `main`.
-4. Resolve conflicts carefully in Ben, Oracle, and Data API operation files.
-5. Make Vapi prompt/tool config thin and assistant-level where possible.
-6. Build and test Data API and backoffice locally.
-7. Deploy backoffice preview.
-8. Deploy Data API preview.
-9. Verify preview Cloud Run revisions.
-10. Run inbound preview call smoke test.
-11. Run outbound preview call smoke test.
-12. Validate field persistence and mission completion/hold behavior.
-13. Only then consider production rollout planning.
-
-## Preview Validation Checklist
-
-### Static Checks
-
-- Data API build passes.
-- Backoffice build passes.
-- Focused Data API tests pass.
-- Lints for changed files pass.
-
-### Vapi Assistant Checks
-
-- Preview outbound assistant ID exists in the active Vapi account.
-- Assistant server URL points to preview Data API:
-  `https://arrakis-data-api-preview-965370637467.us-central1.run.app/v1/webhooks/vapi/voice`
-- Assistant model has a valid provider and model.
-- Assistant tools include:
-  - `ask_arrakis_voice_oracle`
-  - `record_intake_field`
-  - `complete_intake`
-  - `hold_mission`
-
-### Outbound Smoke Test
-
-Use an existing preview lead with at least one known detail and at least one
-missing detail.
-
-Expected:
-
-- Ben uses the customer's first name if available.
-- Ben says he is calling from Kinro about the insurance quote request.
-- Ben does not say "How can I help you today?"
-- Ben confirms known details once.
-- Ben asks only the next missing or unclear detail.
-- Captured answers appear on the lead/timeline/mission as expected.
-- Call recording and transcript attach to the call/lead surfaces.
-
-### Inbound Smoke Test
-
-Call the preview inbound number.
-
-Expected:
-
-- Ben opens with "Thank you for calling Kinro, this is Ben."
-- If matched to a lead, Ben uses that lead context.
-- If not matched, Ben runs full intake.
+- Ben introduces himself once.
+- Ben never says "thanks for calling Kinro" on outbound calls.
+- Ben never says "just a sec" or similar system filler.
+- Ben confirms known details once and does not re-ask them.
 - Ben asks one question at a time.
-- Ben captures fields silently.
-- Ben ends cleanly when intake is complete or the caller ends the call.
+- Ben records only clear customer-provided fields.
+- Ben stops when the mission is complete.
+- Ben hands off instead of answering pricing, coverage advice, binding, claims, legal, or cancellation questions.
 
-### Gatekeeper Smoke Test
+## Suggested Prompt Patch
 
-Simulate an AI screening assistant or receptionist.
+Add this block to the voice runtime instructions:
 
-Expected:
+```text
+Voice behavior:
+- Speak like a concise human operator, not a chatbot.
+- You already introduced yourself in the first message. Do not introduce yourself again.
+- This is an outbound follow-up unless the runtime explicitly says inbound. Do not say "thanks for calling Kinro" on outbound calls.
+- Never say "just a sec", "let me check", "let me process that", or mention systems/tools.
+- Acknowledge each useful answer briefly: "Got it", "Perfect", "That helps", or "Okay".
+- Confirm known details once, then ask only the next mission-needed question.
+- Ask one question at a time.
+- If the customer gives a clear detail, call record_intake_field for that detail.
+- If the mission is complete, call complete_intake and end politely.
+- If unsure, or if the customer asks for pricing/binding/coverage/legal/claims/cancellation advice, hold the mission for a human.
+```
 
-- Ben identifies himself as Ben from Kinro.
-- Ben says he is calling about the customer's insurance quote request.
-- Ben asks to be connected to the customer.
-- Ben does not collect quote details from an unauthorized screening system.
-- Refusal or callback outcomes are recorded for Arrakis.
-
-## Success Criteria
-
-This work is successful when:
-
-- Arrakis, not Vapi, controls Ben's voice reasoning.
-- Inbound and outbound calls have different openings.
-- Outbound calls are purpose-driven and never generic.
-- Known details are confirmed once and used conversationally.
-- Missing and unclear details are asked one at a time.
-- Existing confirmed details are not re-asked.
-- Autopilot can call to collect missing details when eligible.
-- AI screening and gatekeeper calls are handled naturally.
-- Tool calls are silent.
-- The existing Arrakis SMS, WhatsApp, email, dashboard, and mission workflows
-  continue to work.
-- Preview smoke tests pass before production planning starts.
