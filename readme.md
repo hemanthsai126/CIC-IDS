@@ -1,47 +1,22 @@
-# Arrakis Settings DB Change Plan
+# Arrakis Settings Reference
 
-## Goal
+## Purpose
 
-Add the database backing needed for the new Arrakis Settings page without changing the existing UI behavior first.
+The Arrakis `Settings` page centralizes operational controls for Ben autopilot, Slack notifications, Ben engagement windows, Ben frequency limits, and outbound email caps.
 
-The DB work should support:
+The page is visible to all Arrakis users in the first implementation. Admin-only access can be added later once Arrakis has an explicit admin role or allowlist.
 
-- Global Ben autopilot, using the existing DB-backed global control.
-- New-lead autopilot defaults by source.
-- Slack notification filters and backend-only destinations.
-- Engagement hours interpreted in each lead's timezone.
-- Ben-only engagement frequency thresholds.
-- Daily email caps for total system email, Ben email, operator email, and per-operator email.
+## Page Location
 
-## Existing DB Surface To Reuse
+- Dashboard route: `/settings`
+- Navigation label: `Settings`
+- Preview route: `https://arrakis-preview-vvvkve42ma-uc.a.run.app/settings`
 
-Keep using `arrakis.ben_autopilot_controls` for the global Ben autopilot toggle. The Settings page should read and write the existing `control_key = 'global'` row through the existing API path.
+The page reads settings on load and writes changes through dashboard API routes that proxy to the Arrakis data API.
 
-Keep using lead metadata for lead-level Ben autopilot state. Explicit operator overrides on a lead should continue to live under `leads.metadata.benAutopilot`.
+## Save Model
 
-Keep using existing outbound records for counting engagement:
-
-- `arrakis.messages` for SMS, WhatsApp, and email.
-- `arrakis.calls` for voice calls.
-- `arrakis.scheduled_events` for pending Ben steps.
-
-Keep using lead timezone metadata where available. Engagement hours are not stored per timezone; they are stored once as local clock times and evaluated against each lead's timezone.
-
-## New Table: `arrakis.settings`
-
-Use one generic settings table with strict API schemas. This keeps the DB migration small while letting each setting evolve in JSON.
-
-```sql
-CREATE TABLE arrakis.settings (
-  key text PRIMARY KEY,
-  value jsonb NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  updated_by text NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-```
-
-Expected keys:
+The main `Save settings` button writes all DB-backed setting sections:
 
 - `autopilot_default_rules`
 - `slack_notifications`
@@ -49,308 +24,356 @@ Expected keys:
 - `engagement_frequency_thresholds`
 - `email_sending_limits`
 
-The API should validate each key with a dedicated Zod schema before writing. The DB table should stay generic, but the application should not accept arbitrary JSON shapes.
+The global Ben autopilot toggle is separate. It uses the existing Ben autopilot endpoint and existing global autopilot table rather than the generic settings table.
 
-## Setting Payloads
+Settings are validated by backend schemas before they are persisted. Invalid shapes, invalid time strings, invalid day numbers, and negative limits are rejected.
 
-### `autopilot_default_rules`
+## Data Model
 
-Stores new-lead autopilot defaults and future rule dimensions.
+Most settings live in:
 
-```json
-{
-  "version": 1,
-  "newLeadDefaults": {
-    "allSources": false,
-    "sources": {
-      "insuranceleads": true,
-      "smartfinancial": true,
-      "vapi": false,
-      "manual": false,
-      "web_form": false,
-      "email": false,
-      "referral": false,
-      "policy_review": false,
-      "unknown": false
-    }
-  },
-  "rules": []
-}
+```text
+arrakis.settings
+  key text primary key
+  value jsonb not null
+  updated_at timestamptz not null
+  updated_by text null
+  created_at timestamptz not null
 ```
 
-Initial implementation should apply only the `newLeadDefaults` section. The `rules` array can exist but remain empty until status/AMS conditions are implemented.
+Supporting tables:
 
-### `slack_notifications`
+- `arrakis.email_send_daily_usage`: atomic daily email counters.
+- `arrakis.slack_notification_deliveries`: Slack delivery logging and deduplication.
+- `arrakis.ben_autopilot_controls`: existing global Ben autopilot control.
 
-Stores notification filtering and backend-defined destinations. Do not store raw Slack webhook URLs here.
+## Header Status Cards
 
-```json
-{
-  "version": 1,
-  "enabled": true,
-  "destinations": {
-    "default": "ops",
-    "inbox": "inbox",
-    "renewals": "renewals"
-  },
-  "rules": [
-    {
-      "id": "new-leads",
-      "name": "New leads",
-      "enabled": true,
-      "destinationKey": "ops",
-      "eventTypes": ["lead.created"],
-      "sourceIncludes": [],
-      "sourceExcludes": [],
-      "statusIncludes": [],
-      "cooldownMinutes": 15
-    }
-  ]
-}
-```
+The Settings page header shows:
 
-`destinationKey` should map to backend configuration or secret references. The settings UI should only display safe labels.
+- `Global autopilot`: current global Ben autopilot state from the existing DB-backed control.
+- `Engagement time`: always displayed as `Lead local`, because configured hours are interpreted in each lead's timezone.
+- `Daily email cap`: the current total daily Arrakis email cap and today's usage.
+- `Slack destinations`: shown as `Backend`, because raw Slack webhook URLs are not displayed or edited in the UI.
 
-### `engagement_hours`
+The page also shows whether settings are currently DB-backed or only loaded from code defaults.
 
-Stores allowed local clock windows. The same clock window is interpreted in each lead's timezone.
+## Global Autopilot
 
-```json
-{
-  "version": 1,
-  "enabled": true,
-  "days": [1, 2, 3, 4, 5],
-  "startTime": "08:00",
-  "endTime": "18:00",
-  "fallbackTimezone": "America/Chicago",
-  "allowReactiveRepliesOutsideHours": true
-}
-```
+### Control
 
-`fallbackTimezone` is only used when a lead has no stored or inferred timezone. It is not user-facing in the first Settings UI.
+`Ben autopilot enabled globally`
 
-### `engagement_frequency_thresholds`
+### What It Means
 
-Stores Ben-only thresholds. These should not block manual operator sends.
+This is the global kill switch for Ben autopilot.
 
-```json
-{
-  "version": 1,
-  "enabled": true,
-  "perLead": {
-    "maxTouchesPerDay": 3,
-    "maxTouchesPerSevenDays": 8,
-    "maxSmsOrWhatsappPerDay": 2,
-    "maxEmailsPerDay": 2,
-    "maxVoiceCallsPerDay": 1,
-    "maxNoResponseFollowUpsBeforePause": 5
-  },
-  "cooldowns": {
-    "minMinutesBetweenOutbound": 60,
-    "minMinutesAfterCustomerInboundBeforeProactiveFollowup": 15
-  }
-}
-```
+When it is off, Ben should not initiate autopilot actions for any lead, even if a lead-level autopilot toggle is on.
 
-Counts should be computed from existing `messages` and `calls` rows where `direction = 'outbound'` and the actor/source is Ben.
+When it is on, Ben still has to pass all other guardrails:
 
-### `email_sending_limits`
+- Lead-level autopilot enabled.
+- Compliance and do-not-contact checks.
+- Contactability checks.
+- Engagement hours.
+- Engagement frequency thresholds.
+- Email sending limits when the action is email.
 
-Stores daily email caps.
+### Storage
 
-```json
-{
-  "version": 1,
-  "enabled": true,
-  "daily": {
-    "total": 100,
-    "ben": 100,
-    "operator": 100,
-    "perOperator": 25
-  }
-}
-```
+Stored in the existing `arrakis.ben_autopilot_controls` table with `control_key = 'global'`.
 
-These caps should be checked immediately before provider send, not just when scheduling.
+### API
 
-## New Table: `arrakis.email_send_daily_usage`
+- `GET /v1/ben/autopilot`
+- `PATCH /v1/ben/autopilot`
 
-Use a counter table for race-safe daily email caps. Existing `arrakis.messages` can still be the source of truth for message history, but a counter row makes cap checks atomic.
+## New Lead Autopilot Defaults
 
-```sql
-CREATE TABLE arrakis.email_send_daily_usage (
-  usage_date date NOT NULL,
-  scope text NOT NULL,
-  actor_id text NOT NULL DEFAULT '',
-  sent_count integer NOT NULL DEFAULT 0,
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (usage_date, scope, actor_id),
-  CHECK (scope IN ('total', 'ben', 'operator', 'operator_user')),
-  CHECK (sent_count >= 0)
-);
-```
+### Setting Key
 
-Scope behavior:
+`autopilot_default_rules`
 
-- `total` with `actor_id = ''`: all Arrakis outbound email sends.
-- `ben` with `actor_id = ''`: Ben-authored email sends.
-- `operator` with `actor_id = ''`: all operator-authored email sends.
-- `operator_user` with `actor_id = <WorkOS user id>`: a specific operator.
+### Controls
 
-Cap check flow:
+The page exposes source-level toggles:
 
-1. Start a DB transaction before calling SendGrid.
-2. Lock or upsert the relevant usage rows.
-3. Check configured caps.
-4. If a cap is exceeded, abort before provider send and return a clear blocked reason.
-5. If allowed, increment rows and proceed with provider send.
-6. If provider send fails before acceptance, decrement the counters in the same failure path or record the send as not accepted.
+- `All sources`
+- `InsuranceLeads`
+- `SmartFinancial`
+- `Vapi voice intake`
+- `Manual lead`
+- `Web form`
+- `Email lead`
+- `Referral`
+- `Policy review`
+- `Imported / unknown`
 
-For the first implementation, count only accepted provider sends. If we later need strict attempt caps, add a separate attempt counter.
+### What It Means
 
-## New Table: `arrakis.slack_notification_deliveries`
+These toggles decide whether new leads start with Ben autopilot enabled by default.
 
-Use this for dedupe and delivery failure logging.
+`All sources` is the fallback when no specific source setting matches. Source-specific settings override the fallback.
 
-```sql
-CREATE TABLE arrakis.slack_notification_deliveries (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  rule_id text NOT NULL,
-  destination_key text NOT NULL,
-  event_type text NOT NULL,
-  subject_type text NULL,
-  subject_id uuid NULL,
-  lead_id uuid NULL REFERENCES arrakis.leads(id) ON DELETE SET NULL,
-  idempotency_key text NOT NULL,
-  status text NOT NULL,
-  status_code integer NULL,
-  error text NULL,
-  sent_at timestamptz NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-  UNIQUE (idempotency_key),
-  CHECK (status IN ('sent', 'skipped', 'failed'))
-);
+These defaults apply when new leads are created. They do not rewrite existing leads.
 
-CREATE INDEX slack_notification_deliveries_lead_created_idx
-  ON arrakis.slack_notification_deliveries (lead_id, created_at DESC);
-```
+### Current Defaults
 
-The notification sender should insert or upsert with a stable idempotency key before posting. This prevents duplicate Slack posts for the same event/rule/destination.
+- `All sources`: off
+- `InsuranceLeads`: on
+- `SmartFinancial`: on
+- `Vapi voice intake`: off
+- `Manual lead`: off
+- `Web form`: off
+- `Email lead`: off
+- `Referral`: off
+- `Policy review`: off
+- `Imported / unknown`: off
 
-## No New Table For Ben Frequency Counts
+### Backend Enforcement
 
-Do not add a separate Ben engagement counter table initially. Use existing history:
+The lead creation path resolves the normalized external source and applies the matching default to lead metadata.
 
-- `arrakis.messages` for outbound SMS, WhatsApp, and email.
-- `arrakis.calls` for outbound voice.
-- `arrakis.scheduled_events` for pending events that should be skipped or rescheduled.
+Explicit lead-level operator changes still win over source defaults.
 
-Suggested indexes if current performance is not enough:
+### Future Reserved Field
 
-```sql
-CREATE INDEX messages_lead_outbound_channel_at_idx
-  ON arrakis.messages (
-    lead_id,
-    channel,
-    COALESCE(sent_at, created_at) DESC
-  )
-  WHERE direction = 'outbound';
+The setting includes a `rules` array for future status and AMS policy conditions. The first implementation stores this field but does not expose rich rule editing in the UI.
 
-CREATE INDEX calls_lead_outbound_at_idx
-  ON arrakis.calls (
-    lead_id,
-    COALESCE(started_at, created_at) DESC
-  )
-  WHERE direction = 'outbound';
-```
+## Slack Notifications
 
-Only add these if query plans show the current indexes are insufficient.
+### Setting Key
 
-## No Schema Change For Global Autopilot
+`slack_notifications`
 
-Do not migrate global autopilot into `arrakis.settings` now.
+### Controls
 
-Reasons:
+- `Slack notifications enabled`: master switch for all rules.
+- `Default destination key`: safe destination label, not a raw webhook.
+- `Rule cooldown`: cooldown in minutes applied to rules in the first UI.
+- Rule toggles:
+  - `New lead created`
+  - `Inbox activity`
+  - `Inbound SMS or WhatsApp`
+  - `Inbound email received`
+  - `Missed call or voicemail`
+  - `Ben handoff required`
+  - `Ben send failed`
+  - `AMS policy ending soon`
 
-- It already works.
-- It already has update metadata.
-- Existing data API and metrics code read `arrakis.ben_autopilot_controls`.
-- Moving it now would increase risk without improving the Settings UI.
+### What It Means
 
-The Settings API can aggregate from both:
+Slack settings decide which Arrakis events can send Slack notifications.
 
-- `arrakis.ben_autopilot_controls` for the global Ben switch.
-- `arrakis.settings` for all new settings.
+The master toggle must be on, and an individual matching rule must also be enabled.
 
-## Seed Defaults
+Each rule has:
 
-Insert defaults during migration or first-read fallback. Prefer first-read fallback in code plus an optional seed migration so missing rows do not break local/dev DBs.
+- `id`
+- `name`
+- `enabled`
+- `destinationKey`
+- `eventTypes`
+- `sourceIncludes`
+- `sourceExcludes`
+- `statusIncludes`
+- `ownerIncludes`
+- `timezoneIncludes`
+- `coverageIncludes`
+- `cooldownMinutes`
 
-Default values:
+The first UI mainly exposes the master switch, destination key, cooldown, and common rule toggles. The schema already supports additional filters.
 
-- `autopilot_default_rules`: all sources off except `insuranceleads` and `smartfinancial` on, matching current source default behavior.
-- `slack_notifications`: enabled, with current new-lead and inbox behavior represented as rules.
-- `engagement_hours`: weekdays, `08:00` to `18:00`, lead-local, Central Time fallback.
-- `engagement_frequency_thresholds`: Ben per-lead daily defaults from the Settings UI.
-- `email_sending_limits`: total `100`, Ben `100`, operator `100`, per-operator `25`.
+### Destinations
 
-## Rollout Order
+The UI stores destination keys such as:
 
-1. Add `arrakis.settings`.
-2. Add `arrakis.email_send_daily_usage`.
-3. Add `arrakis.slack_notification_deliveries`.
-4. Add default settings readers in the data API.
-5. Add settings write APIs with strict validation.
-6. Wire Settings UI to read/write settings.
-7. Enforce Slack filters and delivery dedupe.
-8. Enforce engagement hours and Ben thresholds.
-9. Enforce email caps at the email provider send boundary.
+- `ops`
+- `inbox`
+- `sales`
+- `renewals`
 
-## Backfill
+Raw Slack webhook URLs are backend-only and are never shown or edited from Settings.
 
-No required destructive backfill.
+### Backend Enforcement
 
-Recommended one-time seed:
+The Slack alert layer loads the DB-backed settings before posting. It matches event type and filters, checks recent delivery cooldowns, posts only for matching enabled rules, and records deliveries in `arrakis.slack_notification_deliveries`.
 
-- Create `autopilot_default_rules` from current hardcoded Ben source defaults.
-- Create `slack_notifications` from current environment-backed notification behavior.
-- Create `engagement_hours`, `engagement_frequency_thresholds`, and `email_sending_limits` from the default payloads above.
+Slack delivery failures should not block lead ingestion or inbox processing.
 
-Do not rewrite existing leads when adding default autopilot rules. Apply new-lead defaults only to future leads unless a separate explicit retroactive workflow is built.
+### Preview Caveat
 
-## Validation And Safety
+Preview settings read/write works, but real Slack posting depends on Slack webhook secrets being configured in preview.
 
-Settings writes should reject:
+## Engagement Hours
+
+### Setting Key
+
+`engagement_hours`
+
+### Controls
+
+- `Enforce engagement hours for proactive Ben sends`
+- Allowed days:
+  - Sunday through Saturday
+- Start time
+- End time
+
+### What It Means
+
+Engagement hours control when Ben autopilot can proactively contact a lead.
+
+The configured time window is interpreted in each lead's local timezone. For example, an 8:00 AM to 6:00 PM window means 8:00 AM to 6:00 PM Pacific for a California lead and 8:00 AM to 6:00 PM Central for a Texas lead.
+
+If a lead has no stored or inferred timezone, the backend falls back to `America/Chicago`.
+
+### Current Defaults
+
+- Enabled: yes
+- Days: Monday through Friday
+- Start: `08:00`
+- End: `18:00`
+- Fallback timezone: `America/Chicago`
+- Reactive replies outside hours: allowed
+
+### Backend Enforcement
+
+Ben proactive outbound actions are blocked outside the allowed window.
+
+Customer-initiated inbound replies can still trigger Ben responses outside hours when autopilot is otherwise allowed.
+
+Manual operator sends are not blocked by engagement hours. The intended operator behavior is a warning, not a hard block.
+
+## Engagement Frequency Thresholds
+
+### Setting Key
+
+`engagement_frequency_thresholds`
+
+### Controls
+
+- `Total Ben touches per lead / day`
+- `Total Ben touches per lead / 7 days`
+- `SMS or WhatsApp per lead / day`
+- `Emails per lead / day`
+- `Voice calls per lead / day`
+- `No-response follow-ups before pause`
+
+### What It Means
+
+These thresholds limit Ben autopilot only. They do not block manual operator sends.
+
+### Current Defaults
+
+- Total Ben touches per lead per day: `3`
+- Total Ben touches per lead per 7 days: `8`
+- SMS or WhatsApp per lead per day: `2`
+- Emails per lead per day: `2`
+- Voice calls per lead per day: `1`
+- No-response follow-ups before pause: `5`
+- Minimum minutes between outbound messages: `60`
+- Minimum minutes after customer inbound before proactive follow-up: `15`
+
+The current UI exposes the per-lead threshold values. Cooldown values are part of the stored schema and backend enforcement.
+
+### Backend Enforcement
+
+Before Ben sends or schedules proactive outbound work, the backend checks recent outbound activity for that lead and channel.
+
+Counts are derived from existing Arrakis message and call history rather than a separate frequency counter table.
+
+When a threshold blocks Ben, the action is skipped or delayed according to the calling path. Operator sends remain allowed unless blocked by another guardrail such as email sending limits.
+
+## Email Sending Limits
+
+### Setting Key
+
+`email_sending_limits`
+
+### Controls
+
+- `Total Arrakis outbound emails / day`
+- `Ben outbound emails / day`
+- `Operator-authored emails / day`
+- `Per-operator emails / day`
+
+The page also displays:
+
+- Used today
+- Remaining
+- Usage date
+
+### What It Means
+
+Email limits cap outbound email volume across Arrakis. They apply close to the provider-send boundary so manual sends, Ben sends, scheduled sends, and retry paths share the same guardrail.
+
+### Current Defaults
+
+- Total Arrakis outbound emails per day: `100`
+- Ben outbound emails per day: `100`
+- Operator-authored emails per day: `100`
+- Per-operator emails per day: `25`
+
+### Backend Enforcement
+
+Before sending email, the backend reserves capacity in `arrakis.email_send_daily_usage`.
+
+Counters are tracked by date and scope:
+
+- `total`
+- `ben`
+- `operator`
+- `operator_user`
+
+If a provider send fails before acceptance, the reserved capacity is released.
+
+Lowering a cap below current usage is allowed, but it immediately blocks additional sends in that scope until the next usage day.
+
+## API Summary
+
+Dashboard proxy routes:
+
+- `GET /api/arrakis/settings`
+- `PATCH /api/arrakis/settings/:key`
+
+Data API routes:
+
+- `GET /v1/settings`
+- `PATCH /v1/settings/:key`
+- `GET /v1/ben/autopilot`
+- `PATCH /v1/ben/autopilot`
+
+`GET /v1/settings` returns:
+
+- Effective settings.
+- Whether rows are persisted or defaults are being used.
+- Latest update metadata.
+- Today's email usage.
+
+## Validation Summary
+
+Backend validation rejects:
 
 - Unknown setting keys.
-- Invalid JSON shape.
-- Negative caps or thresholds.
-- Invalid day numbers.
+- Invalid JSON payload shape.
 - Invalid time strings.
-- Slack rules with unknown destination keys.
-- Email sub-caps that exceed total cap unless the product intentionally allows oversubscription.
+- Invalid day numbers outside `0` through `6`.
+- Negative caps or thresholds.
+- Extremely large caps or thresholds above the schema maximum.
+- Slack rules without required ids, names, destinations, or event arrays.
 
-Runtime enforcement should be fail-closed for risky outbound actions:
+## Preview Test Status
 
-- If email caps cannot be read, block automated Ben email and allow manual operator email only if product decides that is acceptable.
-- If engagement hours cannot be read, use safe defaults.
-- If Slack settings cannot be read, skip Slack rather than blocking lead/inbox processing.
+Preview testing completed:
 
-## Testing Plan
+- Data API tests passed locally.
+- Arrakis package builds passed locally.
+- Preview authenticated `GET /v1/settings` passed.
+- Preview `PATCH /v1/settings/slack_notifications` persisted a temporary marker and restored it.
+- Preview no-op `PATCH` passed for all settings keys.
+- Preview global autopilot `PATCH` passed.
 
-Add unit tests for:
+Not tested end-to-end in preview:
 
-- Settings payload validation.
-- Default settings fallback when rows are missing.
-- New-lead autopilot default resolution by source.
-- Lead-local engagement hour evaluation across Pacific, Central, Eastern, and unknown timezone fallback.
-- Ben threshold blocking using existing message/call rows.
-- Email cap increments and blocks inside a transaction.
-- Slack notification dedupe by idempotency key.
-
-Add integration-style repository tests for:
-
-- Reading and writing `arrakis.settings`.
-- Concurrent email cap checks against `arrakis.email_send_daily_usage`.
-- Slack delivery insert/upsert behavior.
+- Real Slack delivery, because preview Slack webhook secrets may not be configured.
+- Real outbound Ben/email sends, to avoid triggering customer-facing actions during smoke testing.
