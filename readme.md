@@ -8,12 +8,12 @@ The page should let operators safely configure:
 
 - Global Ben autopilot.
 - Slack notification rules.
-- Default autopilot rules by lead source, lead state, and AMS policy conditions.
-- Engagement hours by customer timezone.
-- Engagement frequency thresholds.
+- Default autopilot rules for new leads by source, plus lead state and AMS policy conditions.
+- Engagement hours using a single configured lead timezone.
+- Ben engagement frequency thresholds.
 - Global and per-actor email sending caps.
 
-The settings should be DB-backed wherever possible, auditable, and enforced by the backend paths that actually send messages, schedule events, and post Slack notifications.
+The settings should be DB-backed wherever possible and enforced by the backend paths that actually send messages, schedule events, and post Slack notifications.
 
 ## Current Context
 
@@ -23,7 +23,7 @@ Global Ben autopilot already exists as a DB-backed control in `arrakis.ben_autop
 
 Slack notifications currently exist for new leads and inbox activity, but they are driven by environment webhook settings and code-level behavior. The new Settings page should make notification behavior configurable without redeploying.
 
-Lead timezone and quiet-hours metadata already exist for leads when state can be inferred. Settings should build on that model instead of inventing a separate timezone source.
+Lead timezone and quiet-hours metadata already exist for leads when state can be inferred. For this first Settings version, engagement hours should use one lead-engagement timezone configured on the Settings page, with Central Time as the fallback.
 
 ## Page Structure
 
@@ -35,7 +35,6 @@ The Settings page should be organized into sections:
 4. Engagement Hours
 5. Engagement Frequency Thresholds
 6. Email Sending Limits
-7. Audit Log
 
 Each section should show:
 
@@ -47,7 +46,7 @@ Each section should show:
 
 ## Global Autopilot
 
-This section controls the global Ben autopilot kill switch.
+This section controls the global Ben autopilot kill switch and the default autopilot state for new leads by source.
 
 Required behavior:
 
@@ -57,12 +56,15 @@ Required behavior:
 - When off, Ben should not initiate autopilot actions for any lead, even if lead-level autopilot is enabled.
 - When on, Ben can only act for leads that are individually enabled and not blocked by guardrails such as consent, do-not-contact, engagement hours, or frequency thresholds.
 - Move the global toggle out of the Leads page and into Settings as the canonical control.
+- Add a `New leads autopilot defaults` subsection with one button/toggle for `All sources` and one button/toggle for each known lead source.
+- Source-specific new-lead defaults should be DB-backed and should apply whenever a new lead is created from that source.
+- The `All sources` default should apply to any source that does not have a more specific setting.
 
 Recommended details:
 
-- Show a warning before turning global autopilot on or off.
 - Link to filtered leads affected by the setting.
-- Record changes in an audit log and canonical event stream.
+- Record last updated time and actor.
+- Do not require two-step approval for global autopilot changes in the first version.
 
 ## Slack Notifications
 
@@ -126,19 +128,21 @@ Slack delivery should be resilient:
 
 Security note:
 
-Slack webhook URLs should not be stored as plain editable text unless the existing secret-management pattern supports it safely. Prefer storing a destination key or encrypted secret reference in the DB, with actual webhook secrets managed through environment or secret storage.
+Slack webhook URLs should be managed backend-only. The UI should let operators select from backend-defined destinations, but it should not expose or edit raw Slack webhook URLs. Store a destination key or encrypted secret reference in the DB, with actual webhook secrets managed through environment or secret storage.
 
 ## Default Autopilot Rules
 
-This section controls whether Ben autopilot defaults on or off when a lead is created or transitions into an operational state.
+This section controls whether Ben autopilot defaults on or off when a new lead is created, with additional rule dimensions for operational states and AMS conditions.
 
 Required behavior:
 
 - DB-backed rules.
-- Operators can configure defaults for all lead sources or specific lead sources.
-- Operators can configure defaults for lead statuses and AMS conditions.
+- Operators can configure new-lead defaults for all lead sources or specific lead sources.
+- The UI should present one clear toggle/button for `All sources` and one for each configured source.
+- Operators can also configure rules for lead statuses and AMS conditions.
+- Rules should be applicable in all matching scenarios, not only in the lead list view.
 - Rules apply to new future leads by default.
-- If supporting retroactive updates, require preview and confirmation before changing existing leads.
+- If supporting retroactive updates later, require preview and confirmation before changing existing leads.
 
 Rule precedence:
 
@@ -189,7 +193,7 @@ Rule actions:
 - Use a specific initial mission template.
 - Use a specific channel preference such as SMS first, email first, or voice only after manual approval.
 
-The page should explain whether a rule changes only future leads or also existing leads. For existing leads, the UI should show an estimated affected count before saving.
+The page should explain whether a rule changes only future leads or also existing leads. For the first version, default rules should focus on new leads. If we later add existing-lead application, the UI should show an estimated affected count before saving.
 
 ## Engagement Hours
 
@@ -197,44 +201,37 @@ This section controls when Ben may proactively engage a lead.
 
 Required behavior:
 
-- DB-backed global default engagement hours.
-- Use the lead timezone when available.
-- Infer timezone from lead state where possible.
-- Fall back to a safe default timezone when unknown.
-- Block proactive outbound engagement outside allowed hours.
+- DB-backed global engagement hours.
+- Operators can select allowed days of week.
+- Operators can set the allowed start and end time.
+- Use a single lead-engagement timezone from Settings for all leads in the first version.
+- Fall back to Central Time when no timezone has been configured.
+- Block Ben autopilot from proactive outbound engagement outside allowed hours.
 - If the customer texts, emails, or calls first during non-engagement hours, Ben may reply to that inbound conversation when autopilot is otherwise allowed.
+- Keep the current manual operator send flow. If an operator sends a message to a specific lead outside configured engagement hours, show a small warning but allow the operator to continue.
 
 Configurable fields:
 
 - Allowed days of week.
 - Start time.
 - End time.
-- Timezone strategy: lead timezone, account default timezone, or fixed timezone.
-- Channel-specific windows for SMS, WhatsApp, email, and voice.
+- Lead-engagement timezone.
 - Holiday exceptions.
-- Emergency override or manual operator override.
-
-Recommended defaults:
-
-- SMS and WhatsApp: customer local time, daytime and early evening only.
-- Voice: narrower hours than SMS/email.
-- Email: can be broader, but still respects daily caps and frequency thresholds.
-- No proactive outbound during blocked hours.
-- Reactive replies allowed when the customer initiates during blocked hours, because the customer has already opened the conversation.
 
 The backend should distinguish proactive sends from reactive replies. Scheduled follow-ups should be delayed to the next allowed window, while reactive replies can proceed if the latest customer inbound event is the trigger.
 
 ## Engagement Frequency Thresholds
 
-This section controls how often Ben and operators can engage leads, especially when a person is not responding.
+This section controls how often Ben can engage leads, especially when a person is not responding.
 
 Required behavior:
 
 - DB-backed thresholds.
-- Enforced before scheduling or sending messages.
+- Enforced before Ben schedules or sends messages.
 - Thresholds should be evaluated per lead and per channel.
 - Ben should never exceed configured thresholds.
 - When a threshold blocks an action, the system should record why and optionally create an inbox item for operator review.
+- These thresholds should not block manual operator sends. Operator sends can still count against email sending limits where those limits apply.
 
 Initial thresholds:
 
@@ -254,7 +251,7 @@ Suggested channel rules:
 - SMS/WhatsApp should have stricter caps than email.
 - Voice should require a longer cooldown after missed calls or voicemail.
 - Customer replies should reset no-response counters but not erase compliance or daily caps.
-- Manual operator sends should count toward customer-facing frequency thresholds unless explicitly exempted.
+- Manual operator sends should not be blocked by Ben engagement frequency thresholds.
 
 The page should show what happens when Ben hits a threshold:
 
@@ -318,15 +315,6 @@ Potential keys:
 
 The existing `arrakis.ben_autopilot_controls` table can continue to own the global Ben autopilot toggle unless we decide to migrate it later. The Settings page can read from both the existing global control and the new settings store.
 
-Every settings update should write an audit event with:
-
-- Setting key.
-- Previous value.
-- New value.
-- Actor.
-- Timestamp.
-- Reason or optional note.
-
 ## API Direction
 
 Add dashboard-facing API coverage for settings:
@@ -361,27 +349,31 @@ Default autopilot rules should be checked when:
 - A lead enters AMS or a policy renewal condition.
 - A bulk retroactive apply is explicitly confirmed.
 
-Engagement hours and frequency thresholds should be checked when:
+Engagement hours and Ben frequency thresholds should be checked when:
 
 - Ben creates scheduled mission steps.
 - The scheduler claims due events.
 - Ben sends SMS, WhatsApp, email, or voice calls.
 - Ben reacts to customer inbound messages.
 
+Manual operator sends should check engagement hours only to show a warning. They should not be blocked by engagement hours.
+
 Email limits should be checked immediately before provider send, so all sending paths share the same cap.
 
-## Open Product Decisions
+## Product Decisions
 
-Decide before implementation:
+These decisions are set for the first implementation:
 
-- Should Settings be visible to every Arrakis user or only admins?
-- Should global autopilot changes require confirmation or two-step approval?
-- Should Slack destinations be editable in the UI, or only selectable from preconfigured secret-backed destinations?
-- Should default autopilot rules apply only to new leads, or also to existing leads after preview?
-- Which timezone should be used when a lead has no state or timezone?
-- Should manual operator sends count against global frequency and email caps?
-- Should customer-initiated replies outside engagement hours be allowed for all channels or only SMS/email?
-- What is the first default set of safe caps for email and engagement frequency?
+- Settings should be visible to all Arrakis users in the first implementation.
+- The current repo has WorkOS organization-level access through `KINRO_ARRAKIS_OPERATOR_ORG_ID`, but it does not yet define an Arrakis admin role. Admin gating can be added later if needed, preferably from WorkOS organization roles or an environment-backed allowlist of WorkOS user ids/emails.
+- Global autopilot changes should not require two-step approval.
+- Slack destinations should be backend-only. The UI should select preconfigured destinations, not edit raw webhooks.
+- New-lead autopilot defaults should have a section with controls for all sources and each specific source.
+- Default autopilot rules should be applicable in all matching scenarios.
+- If a lead has no timezone, use Central Time.
+- Manual operator sends should count against email caps where applicable, but should not be blocked by Ben engagement frequency thresholds.
+- Customer-initiated replies outside engagement hours should be allowed for all channels when autopilot is otherwise allowed.
+- The first default cap for total daily email sending should be 100. The first global Ben daily engagement cap should also start at 100 unless a narrower per-lead cap is selected.
 
 ## Suggested Implementation Phases
 
@@ -389,6 +381,7 @@ Phase 1:
 
 - Add Settings route and navigation item.
 - Move global Ben autopilot toggle to Settings.
+- Add new-lead autopilot default toggles for all sources and each known source.
 - Display read-only current defaults for Slack, engagement hours, and caps.
 
 Phase 2:
@@ -406,7 +399,8 @@ Phase 3:
 Phase 4:
 
 - Add engagement hours and frequency thresholds.
-- Enforce in Ben scheduler and send paths.
+- Enforce engagement hours and Ben frequency thresholds in Ben scheduler and send paths.
+- Show non-blocking warnings for manual operator sends outside engagement hours.
 - Add blocked-action logging.
 
 Phase 5:
@@ -414,21 +408,3 @@ Phase 5:
 - Add email sending caps and usage display.
 - Enforce caps at provider-send boundary.
 - Add operator usage breakdown.
-
-## What Should Be Included
-
-These are features I recommend including even though they were not all explicitly requested:
-
-- Audit log for every settings change.
-- Admin-only permissions for risky settings.
-- Dry-run preview showing which leads a rule would affect before saving.
-- Rule precedence display so operators understand why a lead is enabled or disabled.
-- Conflict warnings when two rules overlap.
-- Current usage meters for Slack notification volume, Ben touches, and email caps.
-- Blocked-action history showing when Ben was prevented from sending and why.
-- Test Slack notification button for each destination/rule.
-- Safe default button to restore recommended settings.
-- Environment label so dev, preview, and prod settings are never confused.
-- Export/import JSON for settings backup and review.
-- Metrics for Slack delivery failures, cap hits, engagement-hour deferrals, and frequency-threshold blocks.
-- Optional approval flow for changing global autopilot, email caps, or broad retroactive autopilot rules.
