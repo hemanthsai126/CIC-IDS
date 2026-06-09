@@ -1,385 +1,144 @@
-# Arrakis Settings Reference
+# Pivot Landing Chat Lead Finalization
 
-## Purpose
+## Why This Work Started
 
-The Arrakis `Settings` page centralizes operational controls for Ben autopilot, Slack notifications, Ben engagement windows, Ben frequency limits, and outbound email caps.
+This worktree started after reviewing a production pivot landing webchat from a new lead, Aditya. The chatbot asked for information that the visitor had already provided. That exposed two related problems:
 
-The page is visible to all Arrakis users in the first implementation. Admin-only access can be added later once Arrakis has an explicit admin role or allowlist.
+- Ben did not always have enough prior chat context when generating the next reply.
+- Lead creation/extraction happened too early, before the visitor had finished giving useful business details.
 
-## Page Location
+The original goal was not only to stop repeated questions, but to make the pivot landing chat produce a complete, useful lead record from everything the visitor said.
 
-- Dashboard route: `/settings`
-- Navigation label: `Settings`
-- Preview route: `https://arrakis-preview-vvvkve42ma-uc.a.run.app/settings`
+## Original Expectations
 
-The page reads settings on load and writes changes through dashboard API routes that proxy to the Arrakis data API.
+The expected behavior from the beginning of this work was:
 
-## Save Model
+- Ben should not re-ask for facts already provided in the same chat.
+- Every useful detail from the chat should be extracted into lead fields or lead metadata.
+- The lead timeline should expose the full chat transcript so operators can review the actual conversation.
+- The fix should be tested first on preview before production.
+- Ben should use the full chat context, not only the last 16 turns.
+- Oracle/mission planning should account for all information already provided before asking Ben to follow up.
 
-The main `Save settings` button writes all DB-backed setting sections:
+## What Was Found
 
-- `autopilot_default_rules`
-- `slack_notifications`
-- `engagement_hours`
-- `engagement_frequency_thresholds`
-- `email_sending_limits`
+The current production-style flow is contact-triggered:
 
-The global Ben autopilot toggle is separate. It uses the existing Ben autopilot endpoint and existing global autopilot table rather than the generic settings table.
+1. The visitor sends a chat message.
+2. Data API creates or gets an `agent_run` for the anonymous landing chat session.
+3. Data API calls Backoffice Ben for the next reply.
+4. Data API persists the user and assistant messages into `agent_transcript_events`.
+5. After each persisted turn, Data API projects the transcript into inbox and lead state.
+6. If any user message contains an email or phone number, the backend creates or links a lead immediately.
+7. Generic `createLead()` may create the default new-lead Ben mission and schedule follow-up sequence steps.
 
-Settings are validated by backend schemas before they are persisted. Invalid shapes, invalid time strings, invalid day numbers, and negative limits are rejected.
+This means if a visitor gives contact info halfway through the chat, the lead can be created before the visitor gives name, revenue, years in business, coverage needs, employee count, or other important details. Later details may update the lead, but the initial lead creation and default automation can already have fired.
 
-## Data Model
+## Target Behavior
 
-Most settings live in:
+Pivot landing chat should be transcript-first and finalize-after-chat, not contact-info-first.
 
-```text
-arrakis.settings
-  key text primary key
-  value jsonb not null
-  updated_at timestamptz not null
-  updated_by text null
-  created_at timestamptz not null
-```
+During an active chat:
 
-Supporting tables:
+- Persist every user and Ben message to the landing chat transcript.
+- Let Ben continue the live chat experience.
+- Do not create a lead just because contact info appeared.
+- Do not start the default new-lead Ben mission or default follow-up sequence.
+- Do not send outbound email/SMS follow-up while the visitor is still chatting.
 
-- `arrakis.email_send_daily_usage`: atomic daily email counters.
-- `arrakis.slack_notification_deliveries`: Slack delivery logging and deduplication.
-- `arrakis.ben_autopilot_controls`: existing global Ben autopilot control.
+When the chat is considered finished:
 
-## Header Status Cards
+- Read the full persisted transcript.
+- Extract all provided details from the complete conversation.
+- Create or update the lead once, using the best available complete context.
+- Store structured fields on the lead where supported.
+- Store additional collected facts, QA pairs, and transcript turns in metadata.
+- Add a timeline event that includes the full chat transcript.
+- Trigger Oracle after the final lead record exists.
+- Let Oracle decide whether anything is still missing.
+- Only if Oracle finds missing required details should Ben draft or send a follow-up.
 
-The Settings page header shows:
+## How To Decide A Chat Is Finished
 
-- `Global autopilot`: current global Ben autopilot state from the existing DB-backed control.
-- `Engagement time`: always displayed as `Lead local`, because configured hours are interpreted in each lead's timezone.
-- `Daily email cap`: the current total daily Arrakis email cap and today's usage.
-- `Slack destinations`: shown as `Backend`, because raw Slack webhook URLs are not displayed or edited in the UI.
+There is no reliable browser-close signal, so the best default is an idle finalization window.
 
-The page also shows whether settings are currently DB-backed or only loaded from code defaults.
+Recommended behavior:
 
-## Global Autopilot
+- Every new user message schedules or reschedules a `landing_chat_finalize` job for the same session.
+- The job runs only after an idle period, for example 5-10 minutes after the latest user message.
+- If a newer user message arrived after the job was scheduled, the job exits as stale.
+- Optional later improvement: add an explicit "I'm done" / "Submit request" action that finalizes immediately.
 
-### Control
+This mirrors the safety pattern already used in Ben SMS/email flows: if newer customer context arrives before Ben sends, the older response is suppressed or made stale.
 
-`Ben autopilot enabled globally`
+## Ben And Oracle Expectations
 
-### What It Means
+Ben should behave differently in two phases.
 
-This is the global kill switch for Ben autopilot.
+In-chat phase:
 
-When it is off, Ben should not initiate autopilot actions for any lead, even if a lead-level autopilot toggle is on.
+- Ben can answer and ask the next useful question in the webchat.
+- Ben should use the full stored chat context.
+- Ben should not trigger external follow-up just because he has contact info.
+- If the visitor sends another message before a prior response is applied, the newest context should win.
 
-When it is on, Ben still has to pass all other guardrails:
+Post-chat phase:
 
-- Lead-level autopilot enabled.
-- Compliance and do-not-contact checks.
-- Contactability checks.
-- Engagement hours.
-- Engagement frequency thresholds.
-- Email sending limits when the action is email.
+- Oracle reviews the finalized lead and the full transcript.
+- Oracle decides whether the request is complete enough or needs follow-up.
+- If follow-up is needed, Oracle creates the mission/sequence with the missing facts clearly scoped.
+- Ben drafts or sends only from that Oracle-approved post-chat mission.
 
-### Storage
+## Default Mission Exemption
 
-Stored in the existing `arrakis.ben_autopilot_controls` table with `control_key = 'global'`.
+`pivot-landing-chat` leads should be exempt from the generic default new-lead Ben mission/sequence at creation time.
 
-### API
+Reason:
 
-- `GET /v1/ben/autopilot`
-- `PATCH /v1/ben/autopilot`
+- The landing chat itself is already the intake interaction.
+- Generic follow-up may duplicate questions already answered in chat.
+- Oracle should create the correct post-chat mission after seeing the final transcript.
 
-## New Lead Autopilot Defaults
+Expected implementation direction:
 
-### Setting Key
+- Mark finalized pivot landing chat leads with metadata that suppresses automatic lead engagement/default sequence.
+- Or explicitly skip default mission/sequence creation when `externalSource === "pivot-landing-chat"`.
+- Prefer Oracle-created missions for this source after chat finalization.
 
-`autopilot_default_rules`
+## Data Extraction Expectations
 
-### Controls
+The finalized extraction should capture, at minimum:
 
-The page exposes source-level toggles:
+- Name.
+- Email and/or phone.
+- Company name.
+- State/location.
+- Business type / industry.
+- Coverage requested.
+- Years in business.
+- Annual revenue.
+- Employee count, contractor count, or clear notes when the visitor describes staffing differently.
+- Any other useful facts stated in the chat, even if there is no first-class lead column.
 
-- `All sources`
-- `InsuranceLeads`
-- `SmartFinancial`
-- `Vapi voice intake`
-- `Manual lead`
-- `Web form`
-- `SMS lead`
-- `WhatsApp lead`
-- `Email lead`
-- `Referral`
-- `Policy review`
-- `Imported / unknown`
+Canonical lead fields should be populated where available. Extra facts should be stored in metadata, alongside the transcript and QA pairs.
 
-### What It Means
+## Acceptance Criteria
 
-These toggles decide whether new leads start with Ben autopilot enabled by default.
+A successful pivot landing chat flow should satisfy:
 
-`All sources` is the fallback when no specific source setting matches. Source-specific settings override the fallback.
+- Contact info alone does not immediately create a lead during active chat.
+- A completed/idle chat creates or updates one lead using the full transcript.
+- The dashboard lead details show the extracted facts.
+- The lead timeline includes the full chat transcript.
+- No default Ben new-lead sequence starts for `pivot-landing-chat` before Oracle reviews the final context.
+- Oracle receives the finalized lead context and transcript-derived facts.
+- Ben only sends follow-up after Oracle determines there is still something to ask.
+- Repeated questions are reduced because Ben and Oracle both see the whole chat context.
 
-These defaults apply when new leads are created. They do not rewrite existing leads.
+## Open Decisions
 
-### Current Defaults
+- Exact idle timeout duration: 5 minutes is faster, 10 minutes is safer.
+- Whether to add an explicit "Submit request" button in the chat UI.
+- Whether final extraction should remain deterministic, use an LLM, or combine both.
+- Whether post-chat follow-up should draft for operator review first or send automatically when confidence is high.
 
-- `All sources`: off
-- `InsuranceLeads`: on
-- `SmartFinancial`: on
-- `Vapi voice intake`: off
-- `Manual lead`: off
-- `Web form`: off
-- `SMS lead`: off
-- `WhatsApp lead`: off
-- `Email lead`: off
-- `Referral`: off
-- `Policy review`: off
-- `Imported / unknown`: off
-
-### Backend Enforcement
-
-The lead creation path resolves the normalized external source and applies the matching default to lead metadata.
-
-Explicit lead-level operator changes still win over source defaults.
-
-### Future Reserved Field
-
-The setting includes a `rules` array for future status and AMS policy conditions. The first implementation stores this field but does not expose rich rule editing in the UI.
-
-## Slack Notifications
-
-### Setting Key
-
-`slack_notifications`
-
-### Controls
-
-- `Slack notifications enabled`: master switch for all rules.
-- `Default destination key`: safe destination label, not a raw webhook.
-- `Rule cooldown`: the minimum number of minutes before the same Slack rule can send another alert for the same event or lead. This prevents repeated Slack posts when the same lead or inbox activity is processed more than once.
-- Rule toggles:
-  - `New lead created`
-  - `Inbox activity`
-  - `Inbound SMS or WhatsApp`
-  - `Inbound email received`
-  - `Missed call or voicemail`
-  - `Ben handoff required`
-  - `Ben send failed`
-  - `AMS policy ending soon`
-
-### What It Means
-
-Slack settings decide which Arrakis events can send Slack notifications.
-
-The master toggle must be on, and an individual matching rule must also be enabled.
-
-Each rule has:
-
-- `id`
-- `name`
-- `enabled`
-- `destinationKey`
-- `eventTypes`
-- `sourceIncludes`
-- `sourceExcludes`
-- `statusIncludes`
-- `ownerIncludes`
-- `timezoneIncludes`
-- `coverageIncludes`
-- `cooldownMinutes`
-
-The first UI mainly exposes the master switch, destination key, rule cooldown, and common rule toggles. The schema already supports additional filters.
-
-Example: if `New lead created` has a `15` minute cooldown and the same lead-created event is seen twice within 15 minutes, Arrakis should send the first Slack alert and skip the duplicate. A different lead or a different matching rule can still send its own alert.
-
-### Destinations
-
-The UI stores destination keys such as:
-
-- `ops`
-- `inbox`
-- `sales`
-- `renewals`
-
-Raw Slack webhook URLs are backend-only and are never shown or edited from Settings.
-
-### Backend Enforcement
-
-The Slack alert layer loads the DB-backed settings before posting. It matches event type and filters, checks recent delivery cooldowns, posts only for matching enabled rules, and records deliveries in `arrakis.slack_notification_deliveries`.
-
-Slack delivery failures should not block lead ingestion or inbox processing.
-
-### Preview Caveat
-
-Preview settings read/write works, but real Slack posting depends on Slack webhook secrets being configured in preview.
-
-## Engagement Hours
-
-### Setting Key
-
-`engagement_hours`
-
-### Controls
-
-- `Enforce engagement hours for proactive Ben sends`
-- Allowed days:
-  - Sunday through Saturday
-- Start time
-- End time
-
-### What It Means
-
-Engagement hours control when Ben autopilot can proactively contact a lead.
-
-The configured time window is interpreted in each lead's local timezone. For example, an 8:00 AM to 6:00 PM window means 8:00 AM to 6:00 PM Pacific for a California lead and 8:00 AM to 6:00 PM Central for a Texas lead.
-
-If a lead has no stored or inferred timezone, the backend falls back to `America/Chicago`.
-
-### Current Defaults
-
-- Enabled: yes
-- Days: Monday through Friday
-- Start: `08:00`
-- End: `18:00`
-- Fallback timezone: `America/Chicago`
-- Reactive replies outside hours: allowed
-
-### Backend Enforcement
-
-Ben proactive outbound actions are blocked outside the allowed window.
-
-Customer-initiated inbound replies can still trigger Ben responses outside hours when autopilot is otherwise allowed.
-
-Manual operator sends are not blocked by engagement hours. The intended operator behavior is a warning, not a hard block.
-
-## Engagement Frequency Thresholds
-
-### Setting Key
-
-`engagement_frequency_thresholds`
-
-### Controls
-
-- `Total Ben touches per lead / day`
-- `Total Ben touches per lead / 7 days`
-- `SMS or WhatsApp per lead / day`
-- `Emails per lead / day`
-- `Voice calls per lead / day`
-- `No-response follow-ups before pause`
-
-### What It Means
-
-These thresholds limit Ben autopilot only. They do not block manual operator sends.
-
-### Current Defaults
-
-- Total Ben touches per lead per day: `3`
-- Total Ben touches per lead per 7 days: `8`
-- SMS or WhatsApp per lead per day: `2`
-- Emails per lead per day: `2`
-- Voice calls per lead per day: `1`
-- No-response follow-ups before pause: `5`
-- Minimum minutes between outbound messages: `60`
-- Minimum minutes after customer inbound before proactive follow-up: `15`
-
-The current UI exposes the per-lead threshold values. Cooldown values are part of the stored schema and backend enforcement.
-
-### Backend Enforcement
-
-Before Ben sends or schedules proactive outbound work, the backend checks recent outbound activity for that lead and channel.
-
-Counts are derived from existing Arrakis message and call history rather than a separate frequency counter table.
-
-When a threshold blocks Ben, the action is skipped or delayed according to the calling path. Operator sends remain allowed unless blocked by another guardrail such as email sending limits.
-
-## Email Sending Limits
-
-### Setting Key
-
-`email_sending_limits`
-
-### Controls
-
-- `Total Arrakis outbound emails / day`
-- `Ben outbound emails / day`
-- `Operator-authored emails / day`
-- `Per-operator emails / day`
-
-The page also displays:
-
-- Used today
-- Remaining
-- Usage date
-
-### What It Means
-
-Email limits cap outbound email volume across Arrakis. They apply close to the provider-send boundary so manual sends, Ben sends, scheduled sends, and retry paths share the same guardrail.
-
-### Current Defaults
-
-- Total Arrakis outbound emails per day: `100`
-- Ben outbound emails per day: `100`
-- Operator-authored emails per day: `100`
-- Per-operator emails per day: `25`
-
-### Backend Enforcement
-
-Before sending email, the backend reserves capacity in `arrakis.email_send_daily_usage`.
-
-Counters are tracked by date and scope:
-
-- `total`
-- `ben`
-- `operator`
-- `operator_user`
-
-If a provider send fails before acceptance, the reserved capacity is released.
-
-Lowering a cap below current usage is allowed, but it immediately blocks additional sends in that scope until the next usage day.
-
-## API Summary
-
-Dashboard proxy routes:
-
-- `GET /api/arrakis/settings`
-- `PATCH /api/arrakis/settings/:key`
-
-Data API routes:
-
-- `GET /v1/settings`
-- `PATCH /v1/settings/:key`
-- `GET /v1/ben/autopilot`
-- `PATCH /v1/ben/autopilot`
-
-`GET /v1/settings` returns:
-
-- Effective settings.
-- Whether rows are persisted or defaults are being used.
-- Latest update metadata.
-- Today's email usage.
-
-## Validation Summary
-
-Backend validation rejects:
-
-- Unknown setting keys.
-- Invalid JSON payload shape.
-- Invalid time strings.
-- Invalid day numbers outside `0` through `6`.
-- Negative caps or thresholds.
-- Extremely large caps or thresholds above the schema maximum.
-- Slack rules without required ids, names, destinations, or event arrays.
-
-## Preview Test Status
-
-Preview testing completed:
-
-- Data API tests passed locally.
-- Arrakis package builds passed locally.
-- Preview authenticated `GET /v1/settings` passed.
-- Preview `PATCH /v1/settings/slack_notifications` persisted a temporary marker and restored it.
-- Preview no-op `PATCH` passed for all settings keys.
-- Preview global autopilot `PATCH` passed.
-
-Not tested end-to-end in preview:
-
-- Real Slack delivery, because preview Slack webhook secrets may not be configured.
-- Real outbound Ben/email sends, to avoid triggering customer-facing actions during smoke testing.
