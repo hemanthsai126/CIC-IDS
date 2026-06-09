@@ -1,166 +1,434 @@
-# Arrakis Ben Voice Humanization Plan
+# Arrakis Settings Page Requirements
 
 ## Goal
 
-Make Ben sound like a fast, simple human intake caller, not a generic voice bot.
+Add a new Arrakis dashboard page called `Settings` for operational controls that currently live in scattered places or are hardcoded in backend behavior.
 
-Ben should not independently reason through the whole sales workflow. The mission/oracle decides the objective and the next missing detail. Ben executes that instruction, confirms what matters, records the answer, and stops.
+The page should let operators safely configure:
 
-## Evidence From Current Behavior
+- Global Ben autopilot.
+- Slack notification rules.
+- Default autopilot rules by lead source, lead state, and AMS policy conditions.
+- Engagement hours by customer timezone.
+- Engagement frequency thresholds.
+- Global and per-actor email sending caps.
 
-Recent call/timeline review and prompt inspection show a few recurring problems:
+The settings should be DB-backed wherever possible, auditable, and enforced by the backend paths that actually send messages, schedule events, and post Slack notifications.
 
-- Ben repeats his identity. The current Vapi first message says `Hello, this is Ben calling from Kinro`, and the runtime prompt also says the opening should identify Ben from Kinro. This can produce repeated "Hi, Ben from Kinro" turns.
-- Ben uses call-center filler like "just a sec" instead of acknowledging the customer's answer and moving on.
-- Ben sometimes treats operator-originated call paths as if the customer called Kinro, leading to phrases like "thanks for calling Kinro" on outbound/follow-up calls.
-- Ben does not consistently confirm details back in a human way. He may collect facts without saying "got it" or "I have X, just need Y."
-- Ben can keep asking after the useful objective is already done because the prompt says to collect missing and unclear details, but does not make "stop early" concrete enough.
-- Tool calls are intentionally minimal, which is good, but Ben needs clearer rules for when to call tools and when to simply speak.
+## Current Context
 
-## Behavioral Contract
+Arrakis already has dashboard pages for Inbox, Leads, AMS, Metrics, Markets, and Licensing. The new Settings page should join that navigation as a first-class admin page.
 
-Ben has one job per turn:
+Global Ben autopilot already exists as a DB-backed control in `arrakis.ben_autopilot_controls` with API support through the Ben autopilot endpoints. Today the control appears on the Leads page. The Settings page should become the canonical place to manage the global control. Lead-specific autopilot controls can remain on lead detail pages because those are per-lead decisions.
 
-1. Say one short, natural sentence.
-2. Ask one clear question, only if the oracle/mission says something is still needed.
-3. If the customer answers a detail, record only that detail.
-4. If enough is collected, close and stop.
+Slack notifications currently exist for new leads and inbox activity, but they are driven by environment webhook settings and code-level behavior. The new Settings page should make notification behavior configurable without redeploying.
 
-Ben should never broaden the workflow. He should not discover new tasks, pitch Kinro, explain the whole process, or ask a full intake script unless the mission explicitly says to.
+Lead timezone and quiet-hours metadata already exist for leads when state can be inferred. Settings should build on that model instead of inventing a separate timezone source.
 
-## Prompt Changes
+## Page Structure
 
-### Identity And Opening
+The Settings page should be organized into sections:
 
-Replace the double-intro pattern with a single source of truth.
+1. Global Autopilot
+2. Slack Notifications
+3. Default Autopilot Rules
+4. Engagement Hours
+5. Engagement Frequency Thresholds
+6. Email Sending Limits
+7. Audit Log
 
-Current issue:
+Each section should show:
 
-- `firstMessage`: "Hello, this is Ben calling from Kinro."
-- runtime prompt: "Opening: identify yourself as Ben from Kinro..."
+- Current effective configuration.
+- Last updated time and user.
+- Whether the setting is active, disabled, or blocked by a higher-priority setting.
+- Save/cancel controls.
+- Validation errors before saving.
 
-Change to:
+## Global Autopilot
 
-- `firstMessage`: "Hi, this is Ben from Kinro. Is now still an okay time?"
-- runtime prompt: "Do not introduce yourself again after the first message. If the customer asks who you are, answer once: 'I'm Ben with Kinro, following up on your business insurance request.'"
+This section controls the global Ben autopilot kill switch.
 
-Channel-specific rule:
+Required behavior:
 
-- Outbound: "I am following up on your business insurance request."
-- Inbound: "How can I help with your business insurance?"
-- Never say "thanks for calling Kinro" unless the call is truly an inbound customer call to a Kinro number.
+- Show a single master toggle: `Ben autopilot enabled globally`.
+- Use the existing DB-backed global Ben autopilot setting.
+- Display last updated time and actor.
+- When off, Ben should not initiate autopilot actions for any lead, even if lead-level autopilot is enabled.
+- When on, Ben can only act for leads that are individually enabled and not blocked by guardrails such as consent, do-not-contact, engagement hours, or frequency thresholds.
+- Move the global toggle out of the Leads page and into Settings as the canonical control.
 
-### Confirmation Style
+Recommended details:
 
-Add a required confirmation pattern:
+- Show a warning before turning global autopilot on or off.
+- Link to filtered leads affected by the setting.
+- Record changes in an audit log and canonical event stream.
 
-- Acknowledge each useful answer in 3-6 words.
-- Confirm known details once, not every turn.
-- Before asking for a new detail, name what Ben already has when it reduces confusion.
+## Slack Notifications
 
-Examples:
+This section controls which Arrakis events produce Slack notifications.
 
-- "Got it, general liability."
-- "Okay, Desert Bloom Candles in California."
-- "I have the business and coverage. I just need the ZIP code."
-- "Perfect, that is enough for us to follow up."
+Required behavior:
 
-Do not say:
+- Add a master Slack notifications toggle.
+- Store notification settings in the DB if possible.
+- Allow multiple notification rules.
+- Each rule should decide which events should notify Slack and where they should be sent.
+- Slack messages should include the matching rule name or reason so operators know why they were notified.
+- Backend notification code should check the DB-backed settings before sending Slack.
+- If Slack notifications are off, no configured rule should send Slack messages.
 
-- "Just a sec."
-- "Let me process that."
-- "I am checking my system."
-- "Thanks for calling Kinro" on outbound calls.
-- "Hi, this is Ben from Kinro" more than once.
+Rule fields:
 
-### Oracle/Mission Obedience
+- Rule name.
+- Enabled toggle.
+- Destination, such as default operations channel, inbox channel, sales channel, renewals channel, or a secret reference to a Slack webhook.
+- Event types to include.
+- Event types to exclude.
+- Lead source filters.
+- Lead status filters.
+- AMS policy filters.
+- Priority filters.
+- Owner or assigned operator filters.
+- State/timezone filters.
+- Coverage type filters.
+- Deduplication and cooldown settings.
 
-Add hard rules:
+Initial event filters to support:
 
-- The mission/oracle is the source of truth.
-- Ask only the current missing detail or the exact next question from the mission.
-- If the customer answers something outside the asked detail but it is useful, record it, then return to the mission.
-- If the customer asks a question outside Ben's allowed scope, say a human will follow up.
-- If the mission says no more details are needed, close immediately.
+- New lead created.
+- New lead from specific source.
+- New lead with consent to contact.
+- New lead missing consent.
+- Lead assigned to operator.
+- Inbound SMS or WhatsApp received.
+- Inbound email received.
+- Missed call.
+- Voicemail or call summary ready.
+- Ben handoff required.
+- Ben autopilot paused itself.
+- Ben message send failed.
+- Email bounced or rejected.
+- Lead replied after no response.
+- Lead became high priority.
+- Lead moved to quoted, bound, lost, or AMS.
+- AMS policy ending soon.
+- COI missing.
+- Renewal follow-up due.
+- Do-not-contact or opt-out detected.
 
-### Tool Calls
+Slack delivery should be resilient:
 
-Keep tools minimal:
+- Do not block lead ingestion or inbox processing if Slack fails.
+- Log delivery failures.
+- Avoid duplicate Slack posts for the same event and rule.
+- Rate-limit noisy rules.
 
-- `record_intake_field`: only when the customer clearly gives or corrects one concrete field.
-- `complete_intake`: once the mission is done, customer refuses, asks for callback, or asks for a human.
-- `hold_mission`: when customer asks to stop, wants a human, asks about pricing/binding/claims/legal/coverage advice, or Ben is unsure.
+Security note:
 
-Ben should not call a tool just because he is thinking. No "please wait" filler while tools run.
+Slack webhook URLs should not be stored as plain editable text unless the existing secret-management pattern supports it safely. Prefer storing a destination key or encrypted secret reference in the DB, with actual webhook secrets managed through environment or secret storage.
 
-### Fast Call Flow
+## Default Autopilot Rules
 
-Default outbound call flow:
+This section controls whether Ben autopilot defaults on or off when a lead is created or transitions into an operational state.
 
-1. "Hi, this is Ben from Kinro. Is now still an okay time?"
-2. If yes: "Great. I have this as [business] looking for [coverage]. Is that right?"
-3. If confirmed: ask exactly one missing field from the mission.
-4. After each answer: short acknowledgement + tool call if needed.
-5. When done: "Perfect, that is all I needed. Someone from Kinro can follow up with next steps."
+Required behavior:
 
-If not a good time:
+- DB-backed rules.
+- Operators can configure defaults for all lead sources or specific lead sources.
+- Operators can configure defaults for lead statuses and AMS conditions.
+- Rules apply to new future leads by default.
+- If supporting retroactive updates, require preview and confirmation before changing existing leads.
 
-1. "No problem. What is a better time to reach you?"
-2. Record callback time if provided.
-3. Complete intake and end.
+Rule precedence:
 
-If voicemail:
+1. Global autopilot off blocks all autopilot.
+2. Do-not-contact, missing consent, invalid contact points, or compliance blocks must override every default.
+3. Explicit lead-level operator override wins over source defaults.
+4. The most specific enabled rule wins.
+5. If no rule matches, use the fallback default.
 
-- "Hi, this is Ben with Kinro following up on your business insurance request. We will try you again, or you can reply to our text when convenient."
+Initial rule dimensions:
 
-Do not use "we shop insurance at cheaper prices for you"; it sounds spammy and overpromises.
+- All lead sources.
+- InsuranceLeads.
+- SmartFinancial.
+- Vapi voice intake.
+- Manual lead.
+- Web form lead.
+- Email lead.
+- Referral lead.
+- Policy review lead.
+- Imported lead.
+- Unknown source.
+- New lead.
+- Contacted lead.
+- Stale contacted lead with no response.
+- Quoted lead.
+- Quote follow-up lead.
+- Lost lead.
+- Bound lead.
+- Lead with consent.
+- Lead without consent.
+- Lead with verified phone.
+- Lead with email only.
+- Lead assigned to an operator.
+- Unassigned lead.
+- High-priority lead.
+- AMS policy ending in 7 days.
+- AMS policy ending in 14 days.
+- AMS policy ending in 30 days.
+- AMS policy missing COI.
+- AMS renewal follow-up due.
 
-## Implementation Notes
+Rule actions:
 
-Update both prompt paths, because there are currently two relevant Ben voice prompt builders:
+- Enable autopilot by default.
+- Disable autopilot by default.
+- Require operator review before enabling.
+- Use a specific initial mission template.
+- Use a specific channel preference such as SMS first, email first, or voice only after manual approval.
 
-- `apps/arrakis/data_api/src/operations/repository.ts`
-  - `benFirstMessage()`
-  - `benVoicemailMessage()`
-  - `benRuntimeInstructions()`
-- `apps/arrakis/data_api/src/ben-agent/prompts.ts`
-  - `benFirstMessage()`
-  - `benVoicemailMessage()`
-  - `benExistingLeadRuntimeInstructions()`
-- `apps/arrakis/data_api/src/ben-agent/voice.ts`
-  - `benWebVoiceFirstMessage()`
-  - `benAnonymousWebVoiceInstructions()`
+The page should explain whether a rule changes only future leads or also existing leads. For existing leads, the UI should show an estimated affected count before saving.
 
-Also consider putting shared voice rules in one helper so the Vapi outbound path and newer `ben-agent` path cannot drift.
+## Engagement Hours
 
-## Acceptance Criteria
+This section controls when Ben may proactively engage a lead.
 
-A reviewed Ben call should pass these checks:
+Required behavior:
 
-- Ben introduces himself once.
-- Ben never says "thanks for calling Kinro" on outbound calls.
-- Ben never says "just a sec" or similar system filler.
-- Ben confirms known details once and does not re-ask them.
-- Ben asks one question at a time.
-- Ben records only clear customer-provided fields.
-- Ben stops when the mission is complete.
-- Ben hands off instead of answering pricing, coverage advice, binding, claims, legal, or cancellation questions.
+- DB-backed global default engagement hours.
+- Use the lead timezone when available.
+- Infer timezone from lead state where possible.
+- Fall back to a safe default timezone when unknown.
+- Block proactive outbound engagement outside allowed hours.
+- If the customer texts, emails, or calls first during non-engagement hours, Ben may reply to that inbound conversation when autopilot is otherwise allowed.
 
-## Suggested Prompt Patch
+Configurable fields:
 
-Add this block to the voice runtime instructions:
+- Allowed days of week.
+- Start time.
+- End time.
+- Timezone strategy: lead timezone, account default timezone, or fixed timezone.
+- Channel-specific windows for SMS, WhatsApp, email, and voice.
+- Holiday exceptions.
+- Emergency override or manual operator override.
+
+Recommended defaults:
+
+- SMS and WhatsApp: customer local time, daytime and early evening only.
+- Voice: narrower hours than SMS/email.
+- Email: can be broader, but still respects daily caps and frequency thresholds.
+- No proactive outbound during blocked hours.
+- Reactive replies allowed when the customer initiates during blocked hours, because the customer has already opened the conversation.
+
+The backend should distinguish proactive sends from reactive replies. Scheduled follow-ups should be delayed to the next allowed window, while reactive replies can proceed if the latest customer inbound event is the trigger.
+
+## Engagement Frequency Thresholds
+
+This section controls how often Ben and operators can engage leads, especially when a person is not responding.
+
+Required behavior:
+
+- DB-backed thresholds.
+- Enforced before scheduling or sending messages.
+- Thresholds should be evaluated per lead and per channel.
+- Ben should never exceed configured thresholds.
+- When a threshold blocks an action, the system should record why and optionally create an inbox item for operator review.
+
+Initial thresholds:
+
+- Max total outbound touches per lead per day.
+- Max total outbound touches per lead per 7 days.
+- Max SMS or WhatsApp messages per lead per day.
+- Max emails per lead per day.
+- Max voice calls per lead per day.
+- Minimum cooldown between outbound messages.
+- Minimum cooldown after customer inbound before the next proactive follow-up.
+- Maximum no-response follow-ups before pausing autopilot.
+- Maximum failed-send retries.
+- Maximum cross-channel touches in a sequence.
+
+Suggested channel rules:
+
+- SMS/WhatsApp should have stricter caps than email.
+- Voice should require a longer cooldown after missed calls or voicemail.
+- Customer replies should reset no-response counters but not erase compliance or daily caps.
+- Manual operator sends should count toward customer-facing frequency thresholds unless explicitly exempted.
+
+The page should show what happens when Ben hits a threshold:
+
+- Skip the action.
+- Reschedule for later.
+- Pause autopilot for that lead.
+- Create an inbox item.
+- Notify Slack if a matching Slack rule exists.
+
+## Email Sending Limits
+
+This section controls global outbound email volume.
+
+Required behavior:
+
+- DB-backed email sending caps.
+- Enforced before email is sent through SendGrid or any other provider.
+- If the total daily cap is reached, block further outbound email sends.
+- Support separate caps for total system email, Ben-authored email, and per-operator email.
+- Show current usage and remaining quota for the current day.
+- Log blocked sends with a clear reason.
+
+Initial caps:
+
+- Total Arrakis outbound emails per day.
+- Ben autopilot outbound emails per day.
+- Ben scheduled follow-up emails per day.
+- Operator-authored emails per day.
+- Per-operator outbound emails per day.
+- Optional per-lead emails per day.
+- Optional per-domain emails per day.
+
+Validation:
+
+- Ben and operator sub-caps should not exceed the total cap unless the product intentionally allows oversubscription.
+- Caps should be non-negative integers.
+- Saving a lower cap below current usage should be allowed, but it should immediately block additional sends until the next window.
+- The UI should warn when current usage is already over the new cap.
+
+Enforcement should happen close to the send operation, not only in the scheduler. This avoids bypasses from manual sends, retry paths, or future email features.
+
+## Data Model Direction
+
+Use DB-backed settings with typed payloads. A generic settings table would make sense for most new settings:
 
 ```text
-Voice behavior:
-- Speak like a concise human operator, not a chatbot.
-- You already introduced yourself in the first message. Do not introduce yourself again.
-- This is an outbound follow-up unless the runtime explicitly says inbound. Do not say "thanks for calling Kinro" on outbound calls.
-- Never say "just a sec", "let me check", "let me process that", or mention systems/tools.
-- Acknowledge each useful answer briefly: "Got it", "Perfect", "That helps", or "Okay".
-- Confirm known details once, then ask only the next mission-needed question.
-- Ask one question at a time.
-- If the customer gives a clear detail, call record_intake_field for that detail.
-- If the mission is complete, call complete_intake and end politely.
-- If unsure, or if the customer asks for pricing/binding/coverage/legal/claims/cancellation advice, hold the mission for a human.
+arrakis.settings
+  key text primary key
+  value jsonb not null
+  updated_at timestamptz not null
+  updated_by text null
 ```
 
+Potential keys:
+
+- `slack_notifications`
+- `autopilot_default_rules`
+- `engagement_hours`
+- `engagement_frequency_thresholds`
+- `email_sending_limits`
+
+The existing `arrakis.ben_autopilot_controls` table can continue to own the global Ben autopilot toggle unless we decide to migrate it later. The Settings page can read from both the existing global control and the new settings store.
+
+Every settings update should write an audit event with:
+
+- Setting key.
+- Previous value.
+- New value.
+- Actor.
+- Timestamp.
+- Reason or optional note.
+
+## API Direction
+
+Add dashboard-facing API coverage for settings:
+
+- `GET /v1/settings`
+- `GET /v1/settings/:key`
+- `PATCH /v1/settings/:key`
+- Existing `GET /v1/ben/autopilot`
+- Existing `PATCH /v1/ben/autopilot`
+
+Settings responses should include:
+
+- Current value.
+- Default value if no DB value exists.
+- Effective value after applying defaults.
+- Last updated metadata.
+- Validation warnings.
+
+Write APIs should validate payloads with strict schemas. Invalid settings should never be persisted.
+
+## Enforcement Points
+
+Settings are only useful if the backend paths enforce them.
+
+Slack notification settings should be checked in the Slack alert layer before a payload is posted.
+
+Default autopilot rules should be checked when:
+
+- A lead is created.
+- A lead source is normalized.
+- A lead status changes.
+- A lead enters AMS or a policy renewal condition.
+- A bulk retroactive apply is explicitly confirmed.
+
+Engagement hours and frequency thresholds should be checked when:
+
+- Ben creates scheduled mission steps.
+- The scheduler claims due events.
+- Ben sends SMS, WhatsApp, email, or voice calls.
+- Ben reacts to customer inbound messages.
+
+Email limits should be checked immediately before provider send, so all sending paths share the same cap.
+
+## Open Product Decisions
+
+Decide before implementation:
+
+- Should Settings be visible to every Arrakis user or only admins?
+- Should global autopilot changes require confirmation or two-step approval?
+- Should Slack destinations be editable in the UI, or only selectable from preconfigured secret-backed destinations?
+- Should default autopilot rules apply only to new leads, or also to existing leads after preview?
+- Which timezone should be used when a lead has no state or timezone?
+- Should manual operator sends count against global frequency and email caps?
+- Should customer-initiated replies outside engagement hours be allowed for all channels or only SMS/email?
+- What is the first default set of safe caps for email and engagement frequency?
+
+## Suggested Implementation Phases
+
+Phase 1:
+
+- Add Settings route and navigation item.
+- Move global Ben autopilot toggle to Settings.
+- Display read-only current defaults for Slack, engagement hours, and caps.
+
+Phase 2:
+
+- Add DB-backed settings table or equivalent repository.
+- Add editable Slack notification master toggle and filters.
+- Enforce Slack filters in notification sending.
+
+Phase 3:
+
+- Add default autopilot rules by source/status/AMS condition.
+- Enforce rules on lead creation and state transitions.
+- Add preview for retroactive changes.
+
+Phase 4:
+
+- Add engagement hours and frequency thresholds.
+- Enforce in Ben scheduler and send paths.
+- Add blocked-action logging.
+
+Phase 5:
+
+- Add email sending caps and usage display.
+- Enforce caps at provider-send boundary.
+- Add operator usage breakdown.
+
+## What Should Be Included
+
+These are features I recommend including even though they were not all explicitly requested:
+
+- Audit log for every settings change.
+- Admin-only permissions for risky settings.
+- Dry-run preview showing which leads a rule would affect before saving.
+- Rule precedence display so operators understand why a lead is enabled or disabled.
+- Conflict warnings when two rules overlap.
+- Current usage meters for Slack notification volume, Ben touches, and email caps.
+- Blocked-action history showing when Ben was prevented from sending and why.
+- Test Slack notification button for each destination/rule.
+- Safe default button to restore recommended settings.
+- Environment label so dev, preview, and prod settings are never confused.
+- Export/import JSON for settings backup and review.
+- Metrics for Slack delivery failures, cap hits, engagement-hour deferrals, and frequency-threshold blocks.
+- Optional approval flow for changing global autopilot, email caps, or broad retroactive autopilot rules.
